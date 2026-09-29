@@ -43,23 +43,32 @@ export async function api<T = any>(
   path: string,
   { token, body }: { token?: string; body?: unknown } = {},
 ): Promise<ApiResult<T>> {
-  let last: ApiResult<T> = { status: 0, data: null as T };
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+  const send = async (): Promise<ApiResult<T>> => {
     try {
       const res = await request(app)[method](path)
         .set(token ? { Authorization: `Bearer ${token}` } : {})
         .send(body ?? {});
-      last = { status: res.status, data: res.body as T };
+      return { status: res.status, data: res.body as T };
     } catch (err) {
-      // Socket-level failure: treat like a dropped connection and retry.
-      last = { status: 0, data: { error: { code: "TRANSPORT", message: String(err) } } as T };
+      // Socket-level failure: report it as a status so callers stay uniform.
+      return {
+        status: 0,
+        data: { error: { code: "TRANSPORT", message: String(err) } } as T,
+      };
     }
+  };
 
-    if (!isTransient(last.status) || attempt === MAX_ATTEMPTS) break;
+  // Only reads are retried. A POST may have committed server-side before the
+  // response was lost, so replaying one can double-apply a mutation and turn
+  // infrastructure flakiness into a real, confusing failure.
+  if (method !== "get") return send();
+
+  let last = await send();
+  for (let attempt = 2; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    if (!isTransient(last.status)) break;
     await sleep(500 * attempt);
+    last = await send();
   }
-
   return last;
 }
 
