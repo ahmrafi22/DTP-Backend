@@ -8,6 +8,24 @@ import type { SerializedRequest } from "../src/shared/types.js";
 
 export const app = createApp();
 
+/** Attempts per request before a transport failure is called a real failure. */
+const MAX_ATTEMPTS = 3;
+
+/**
+ * A status that means "the request never reached the handler".
+ *
+ * The suites run against a pooled Postgres over the network, and the pooler
+ * drops idle connections — that surfaces as a socket error or a bare 500 from
+ * the error middleware, not as an application decision. Retrying only those
+ * keeps infrastructure flakiness from reading as a product regression, while
+ * a real 4xx (the assertions these tests actually make) is never retried.
+ */
+function isTransient(status: number): boolean {
+  return status === 0 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 /** Fresh demo world before each suite (files run sequentially). */
 async function reseed(): Promise<void> {
   await seed();
@@ -25,10 +43,24 @@ export async function api<T = any>(
   path: string,
   { token, body }: { token?: string; body?: unknown } = {},
 ): Promise<ApiResult<T>> {
-  const res = await request(app)[method](path)
-    .set(token ? { Authorization: `Bearer ${token}` } : {})
-    .send(body ?? {});
-  return { status: res.status, data: res.body as T };
+  let last: ApiResult<T> = { status: 0, data: null as T };
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const res = await request(app)[method](path)
+        .set(token ? { Authorization: `Bearer ${token}` } : {})
+        .send(body ?? {});
+      last = { status: res.status, data: res.body as T };
+    } catch (err) {
+      // Socket-level failure: treat like a dropped connection and retry.
+      last = { status: 0, data: { error: { code: "TRANSPORT", message: String(err) } } as T };
+    }
+
+    if (!isTransient(last.status) || attempt === MAX_ATTEMPTS) break;
+    await sleep(500 * attempt);
+  }
+
+  return last;
 }
 
 export const get = (path: string, token?: string): Promise<ApiResult> => api("get", path, { token });
