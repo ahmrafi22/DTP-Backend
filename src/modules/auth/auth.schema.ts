@@ -21,6 +21,7 @@ export const registerSchema = z
     password: z.string().min(6).max(72),
     role: z.enum(["passenger", "driver"]),
     homeStopId: z.string().refine((id) => id in NODES, "Unknown stop").nullish(),
+    usualDropStopId: z.string().refine((id) => id in NODES, "Unknown stop").nullish(),
     vehicleName: z.string().trim().min(1).max(40).optional(),
     vehicleCapacity: z.number().int().min(1).max(8).optional(),
   })

@@ -8,6 +8,7 @@ import { authRouter } from "./modules/auth/index.js";
 import { networkRouter } from "./modules/network/index.js";
 import { ridesRouter } from "./modules/rides/index.js";
 import { adminRouter } from "./modules/admin/index.js";
+import { mapRouter } from "./modules/map/index.js";
 import { pool } from "./shared/db.js";
 import "./shared/express.js";
 
@@ -32,6 +33,7 @@ export function createApp(): Express {
   app.use(networkRouter);
   app.use(ridesRouter);
   app.use(adminRouter);
+  app.use(mapRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

@@ -59,6 +59,7 @@ export interface UserRow extends QueryResultRow {
   password_hash: string;
   role: Role;
   home_stop_id: string | null;
+  usual_drop_stop_id: string | null;
   is_online: boolean;
   created_at: Date;
 }
@@ -68,6 +69,8 @@ export interface VehicleRow extends QueryResultRow {
   driver_id: string;
   name: string;
   capacity: number;
+  base_stop_id: string | null;
+  color: string | null;
   created_at: Date;
 }
 
@@ -178,6 +181,8 @@ export interface SerializedVehicle {
   driverId: string;
   name: string;
   capacity: number;
+  baseStopId: string | null;
+  color: string | null;
 }
 
 export interface SerializedUser {
@@ -186,6 +191,7 @@ export interface SerializedUser {
   phone: string;
   role: Role;
   homeStopId: string | null;
+  usualDropStopId: string | null;
   isOnline: boolean;
   /** Drivers only — a passenger never carries a vehicle. */
   vehicle?: SerializedVehicle | null;
@@ -252,4 +258,62 @@ export interface SerializedCoRider {
   firstName: string;
   dropStopId: string;
   status: RequestStatus;
+}
+
+// ---------------------------------------------------------------------------
+// Live map + hop-on joining
+// ---------------------------------------------------------------------------
+
+/** One passenger aboard a live ride. First name + get-off stop — never a fare. */
+export interface MapLivePassenger {
+  firstName: string;
+  dropStopId: string;
+  status: RequestStatus;
+}
+
+/** A running trip as the map sees it: path, progress, who is aboard. */
+export interface MapLiveRide {
+  id: string;
+  status: RideStatus;
+  /** Ordered stop ids of the primary rider — the path the auto is driving. */
+  stopIds: string[];
+  /** 0–1 along the path while STARTED (time-based, from the STARTED event). */
+  progress: number;
+  /** Expected total trip duration in seconds (sum of the path's legs). */
+  totalSec: number;
+  passengers: MapLivePassenger[];
+}
+
+/** One driver as rendered on the map — this is the whole sprite's state. */
+export interface MapLiveDriver {
+  driverId: string;
+  driverName: string;
+  vehicleId: string;
+  vehicleName: string;
+  color: string | null;
+  online: boolean;
+  /** offline = engine off at the base stop; waiting = free seats, no trip. */
+  phase: "offline" | "waiting" | "onboard";
+  baseStopId: string | null;
+  seatsTaken: number;
+  capacity: number;
+  /** Present while phase = "onboard". */
+  ride: MapLiveRide | null;
+}
+
+/** GET /map/live payload — one poll, one snapshot of the whole fleet. */
+export interface MapLivePayload {
+  drivers: MapLiveDriver[];
+  serverTime: string;
+}
+
+/** GET /rides/:id/preview payload — what a hop-on passenger sees before joining. */
+export interface JoinPreview {
+  ride: SerializedRide;
+  /** Ordered stop ids of the running trip; get-in must precede get-out. */
+  stops: string[];
+  /** Seats open right now. */
+  seatsFree: number;
+  /** The joiner's own fare at the current riders-per-leg, if they joined now. */
+  fare: Fare;
 }

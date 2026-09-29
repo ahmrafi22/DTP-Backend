@@ -26,9 +26,9 @@ authRouter.post(
     const hash = await hashPassword(body.password);
     const user = await withTransaction(async (client) => {
       const { rows } = await client.query<UserRow>(
-        `INSERT INTO users (name, phone, password_hash, role, home_stop_id)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [body.name, body.phone, hash, body.role, body.homeStopId ?? null],
+        `INSERT INTO users (name, phone, password_hash, role, home_stop_id, usual_drop_stop_id)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [body.name, body.phone, hash, body.role, body.homeStopId ?? null, body.usualDropStopId ?? null],
       );
       const created = rows[0];
       if (!created) throw new Error("INSERT ... RETURNING produced no user row");

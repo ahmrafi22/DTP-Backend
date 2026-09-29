@@ -19,13 +19,21 @@ export function serializeUser(row: UserRow, vehicle: VehicleRow | null = null): 
     phone: row.phone,
     role: row.role,
     homeStopId: row.home_stop_id,
+    usualDropStopId: row.usual_drop_stop_id,
     isOnline: row.is_online,
     ...(row.role === "driver" ? { vehicle: vehicle ? serializeVehicle(vehicle) : null } : {}),
   };
 }
 
 export function serializeVehicle(row: VehicleRow): SerializedVehicle {
-  return { id: row.id, driverId: row.driver_id, name: row.name, capacity: row.capacity };
+  return {
+    id: row.id,
+    driverId: row.driver_id,
+    name: row.name,
+    capacity: row.capacity,
+    baseStopId: row.base_stop_id,
+    color: row.color,
+  };
 }
 
 /** Sign a session token carrying the user id and role as claims. */

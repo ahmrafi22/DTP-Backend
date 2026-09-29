@@ -15,7 +15,9 @@ import {
   eventsForRide,
   getRequestById,
   getRideById,
-  joinRide,
+  admitRider,
+  joinPreview,
+  joinRideByStops,
   passengerHistory,
   pendingPoolGroups,
   rateRequest,
@@ -27,7 +29,9 @@ import { TRIP_ACTIONS } from "./rides.constants.js";
 import {
   acceptRequestsSchema,
   cancelRideSchema,
-  joinRideSchema,
+  admitRiderSchema,
+  joinByStopsSchema,
+  previewSchema,
   rateRideSchema,
   requestRideSchema,
   setOnlineSchema,
@@ -141,15 +145,55 @@ ridesRouter.post(
   }),
 );
 
+ridesRouter.get(
+  "/rides/:id/preview",
+  authenticate,
+  requireRole("passenger"),
+  asyncHandler(async (req, res) => {
+    const query = previewSchema.parse({
+      pickupStopId: req.query.pickupStopId,
+      dropStopId: req.query.dropStopId,
+    });
+    res.json(
+      await joinPreview({
+        passengerId: req.user.id,
+        rideId: param(req, "id"),
+        pickupStopId: query.pickupStopId,
+        dropStopId: query.dropStopId,
+      }),
+    );
+  }),
+);
+
+// Driver admits a pre-booked (REQUESTED) rider into their own running trip.
 ridesRouter.post(
-  "/rides/:id/join",
+  "/rides/:id/admit",
   authenticate,
   requireRole("driver"),
   asyncHandler(async (req, res) => {
-    const body = joinRideSchema.parse(req.body);
+    const body = admitRiderSchema.parse(req.body);
     res.json(
-      await joinRide({ driverId: req.user.id, rideId: param(req, "id"), requestId: body.requestId }),
+      await admitRider({ driverId: req.user.id, rideId: param(req, "id"), requestId: body.requestId }),
     );
+  }),
+);
+
+// Hop-on joining: the passenger picks get-in/get-out stops on the running
+// trip and claims a free seat themselves — no driver approval needed.
+ridesRouter.post(
+  "/rides/:id/join",
+  authenticate,
+  requireRole("passenger"),
+  asyncHandler(async (req, res) => {
+    const body = joinByStopsSchema.parse(req.body);
+    const result = await joinRideByStops({
+      passengerId: req.user.id,
+      rideId: param(req, "id"),
+      pickupStopId: body.pickupStopId,
+      dropStopId: body.dropStopId,
+      idempotencyKey: body.idempotencyKey ?? null,
+    });
+    res.status(result.replayed ? 200 : 201).json(result);
   }),
 );
 

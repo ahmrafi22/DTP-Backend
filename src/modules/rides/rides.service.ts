@@ -3,16 +3,19 @@ import type { DbClient } from "../../shared/db.js";
 import { badRequest, conflict, forbidden, notFound } from "../../shared/errors.js";
 import {
   edgeByLegId,
+  getEdge,
   getRoute,
   legsBetween,
   priceLegs,
   shortestPath,
 } from "../../graph/index.js";
 import type { Edge, RidersPerLeg } from "../../graph/index.js";
+import { liveRideFor } from "../map/map.routes.js";
 import type {
   Fare,
   FareLegRow,
   FareLine,
+  JoinPreview,
   RideEventRow,
   RideRequestRow,
   RideRequestWithNameRow,
@@ -535,24 +538,181 @@ export async function acceptRequests({
 }
 
 /**
- * Mid-trip joiner (PRD pool engine): adds a pending request to an existing
- * active ride when a seat is free and routes overlap. Seat claim is one
- * atomic conditional UPDATE — a losing racer sees 0 rows and gets a clean 409.
+ * Hop-on joining: a passenger can board a running trip when a seat is free.
+ *
+ * The path they may ride is the primary (earliest) member's ordered stop
+ * list — the auto is driving that line, so get-in and get-out must both be
+ * stops on it, in travel order, ahead of where the auto already is. The
+ * joiner's fare is priced at the current riders-per-leg plus themselves, so
+ * the preview matches what joining actually costs right now.
  */
-export async function joinRide({
-  driverId,
+
+/** Every index a stop appears at on the path (stops can repeat on loops). */
+function stopIndexes(path: string[], stopId: string): number[] {
+  const indexes: number[] = [];
+  path.forEach((stop, i) => {
+    if (stop === stopId) indexes.push(i);
+  });
+  return indexes;
+}
+
+/**
+ * Resolve get-in/get-out to a slice of the trip path. Throws a clear 400 when
+ * either stop is not on the path, the order is impossible, or the get-in is
+ * behind the auto's current position.
+ */
+function resolveJoinSlice(
+  path: string[],
+  pickupStopId: string,
+  dropStopId: string,
+  progress: number,
+): { legs: Edge[]; stopIds: string[] } {
+  const pickupIndexes = stopIndexes(path, pickupStopId);
+  const dropIndexes = stopIndexes(path, dropStopId);
+  if (pickupIndexes.length === 0 || dropIndexes.length === 0) {
+    throw badRequest("Get-in and get-out must be stops on this trip", { stops: path });
+  }
+  const minGetIn = Math.ceil(progress * (path.length - 1));
+  const pickup = pickupIndexes.find((i) => i >= minGetIn);
+  const drop = dropIndexes[dropIndexes.length - 1];
+  if (pickup === undefined) {
+    throw badRequest("The auto has already passed that stop", { stops: path });
+  }
+  if (drop === undefined) {
+    throw badRequest("Get-out is not on this trip", { stops: path });
+  }
+  if (drop <= pickup) {
+    throw badRequest("Get-out must come after get-in on this trip", { stops: path });
+  }
+  const stopIds = path.slice(pickup, drop + 1);
+  const legs: Edge[] = [];
+  for (let i = pickup; i < drop; i += 1) {
+    const from = path[i];
+    const to = path[i + 1];
+    if (!from || !to) throw badRequest("The trip path is malformed");
+    const leg = getEdge(from, to);
+    if (!leg) throw badRequest("The trip path has a leg that no longer exists");
+    legs.push(leg);
+  }
+  return { legs, stopIds };
+}
+
+/** Riders-per-leg across the current members of a ride. */
+async function ridersPerLegOnRide(
+  client: DbClient | null,
+  rideId: string,
+): Promise<Record<string, number>> {
+  const q = client ? client.query.bind(client) : query;
+  const { rows } = await q<{ leg_ids: string[] }>(
+    `SELECT leg_ids FROM ride_requests
+     WHERE ride_id = $1 AND status IN ('MATCHED', 'DRIVER_ARRIVED', 'STARTED')`,
+    [rideId],
+  );
+  const ridersPerLeg: Record<string, number> = {};
+  for (const row of rows) {
+    for (const legId of row.leg_ids) {
+      ridersPerLeg[legId] = (ridersPerLeg[legId] ?? 0) + 1;
+    }
+  }
+  return ridersPerLeg;
+}
+
+async function vehicleById(vehicleId: string): Promise<VehicleRow | null> {
+  return firstOrNull(await query<VehicleRow>("SELECT * FROM vehicles WHERE id = $1", [vehicleId]));
+}
+
+/**
+ * What joining would look like right now: the trip's stops, free seats and
+ * the joiner's own fare at the current occupancy. Read-only — the price can
+ * change the moment someone else claims a seat, so the UI polls this.
+ */
+export async function joinPreview({
+  passengerId,
   rideId,
-  requestId,
+  pickupStopId,
+  dropStopId,
 }: {
-  driverId: string;
+  passengerId: string;
   rideId: string;
-  requestId: string;
-}): Promise<{ ride: SerializedRide; request: SerializedRequest }> {
-  const vehicle = await requireVehicleForDriver(driverId);
-  await requireDriverOnline(driverId);
+  pickupStopId: string;
+  dropStopId: string;
+}): Promise<JoinPreview> {
   const ride = await getRideById(rideId);
   if (!ride) throw notFound("Ride not found");
-  if (ride.vehicle_id !== vehicle?.id) throw forbidden("Not your ride");
+  if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
+    throw conflict("RIDE_NOT_ACTIVE", "Ride is not accepting joiners");
+  }
+  const active = firstOrNull(
+    await query(
+      `SELECT 1 FROM ride_requests
+       WHERE passenger_id = $1 AND status IN ('REQUESTED', 'MATCHED', 'DRIVER_ARRIVED', 'STARTED')
+       LIMIT 1`,
+      [passengerId],
+    ),
+  );
+  if (active) throw conflict("ACTIVE_RIDE_EXISTS", "You are already on a ride");
+
+  const members = await serializeRideMembers(rideId);
+  if (members.length === 0) throw conflict("RIDE_EMPTY", "This ride has no riders yet");
+  const vehicle = await vehicleById(ride.vehicle_id);
+  if (!vehicle) throw notFound("Ride vehicle disappeared");
+
+  const primary = members[0];
+  if (!primary) throw conflict("RIDE_EMPTY", "This ride has no riders yet");
+  const { live } = await liveRideFor(rideId);
+  const { legs } = resolveJoinSlice(
+    primary.stopIds,
+    pickupStopId,
+    dropStopId,
+    live?.progress ?? 0,
+  );
+
+  const ridersPerLeg = await ridersPerLegOnRide(null, rideId);
+  const joinerRidersPerLeg: RidersPerLeg = {};
+  for (const leg of legs) {
+    joinerRidersPerLeg[leg.id] = (ridersPerLeg[leg.id] ?? 0) + 1;
+  }
+
+  return {
+    ride: serializeRide(ride),
+    stops: primary.stopIds,
+    seatsFree: vehicle.capacity - ride.seats_taken,
+    fare: priceLegs(legs, joinerRidersPerLeg),
+  };
+}
+
+/**
+ * The hop-on itself. Same rules as the preview, enforced again inside the
+ * transaction: the seat claim is one atomic conditional UPDATE (PRD §11), the
+ * stop slice is re-validated against fresh state, the joiner's request is
+ * born MATCHED, and every member's fare is repriced so shared-leg discounts
+ * cascade to everyone already aboard.
+ */
+export async function joinRideByStops({
+  passengerId,
+  rideId,
+  pickupStopId,
+  dropStopId,
+  idempotencyKey,
+}: {
+  passengerId: string;
+  rideId: string;
+  pickupStopId: string;
+  dropStopId: string;
+  idempotencyKey?: string | null;
+}): Promise<{ ride: SerializedRide; request: SerializedRequest; replayed: boolean }> {
+  if (idempotencyKey) {
+    const existing = firstOrNull(
+      await query("SELECT id FROM ride_requests WHERE idempotency_key = $1", [idempotencyKey]),
+    );
+    if (existing) {
+      const request = await serializeRequestById(existing.id);
+      if (!request) throw notFound("Ride request not found");
+      const ride = request.rideId ? await getRideById(request.rideId) : null;
+      if (!ride) throw conflict("RIDE_GONE", "The joined ride no longer exists");
+      return { ride: serializeRide(ride), request, replayed: true };
+    }
+  }
 
   return withTransaction(async (client) => {
     const current = firstOrNull(
@@ -563,24 +723,137 @@ export async function joinRide({
       throw conflict("RIDE_NOT_ACTIVE", "Ride is not accepting joiners");
     }
 
-    const request = firstOrNull(
+    const active = firstOrNull(
+      await client.query(
+        `SELECT 1 FROM ride_requests
+         WHERE passenger_id = $1 AND status IN ('REQUESTED', 'MATCHED', 'DRIVER_ARRIVED', 'STARTED')
+         LIMIT 1`,
+        [passengerId],
+      ),
+    );
+    if (active) throw conflict("ACTIVE_RIDE_EXISTS", "You are already on a ride");
+
+    const members = await serializeRideMembers(rideId);
+    const primary = members[0];
+    if (!primary) throw conflict("RIDE_EMPTY", "This ride has no riders yet");
+
+    const vehicle = await vehicleById(current.vehicle_id);
+    if (!vehicle) throw notFound("Ride vehicle disappeared");
+
+    const { live } = await liveRideFor(rideId);
+    const { legs, stopIds } = resolveJoinSlice(
+      primary.stopIds,
+      pickupStopId,
+      dropStopId,
+      live?.progress ?? 0,
+    );
+
+    // THE atomic conditional update (PRD §11): 1 row = seat claimed, 0 = full.
+    const claim = await client.query(
+      `UPDATE rides SET seats_taken = seats_taken + 1, updated_at = now()
+       WHERE id = $1 AND seats_taken + 1 <= capacity`,
+      [rideId],
+    );
+    if (rowsAffected(claim) === 0) {
+      throw conflict("RIDE_FULL", "Seat no longer available");
+    }
+
+    const ridersPerLeg = await ridersPerLegOnRide(client, rideId);
+    const joinerRidersPerLeg: RidersPerLeg = {};
+    for (const leg of legs) {
+      joinerRidersPerLeg[leg.id] = (ridersPerLeg[leg.id] ?? 0) + 1;
+    }
+    const fare = priceLegs(legs, joinerRidersPerLeg);
+
+    const inserted = await client.query<RideRequestRow>(
+      `INSERT INTO ride_requests
+        (passenger_id, ride_id, pickup_stop, drop_stop, route_id, leg_ids, stop_ids, seats,
+         status, base_fare_paisa, distance_charge_paisa, pool_discount_paisa, total_fare_paisa,
+         idempotency_key)
+       VALUES ($1, $2, $3, $4, NULL, $5, $6, 1, 'MATCHED', $7, $8, $9, $10, $11)
+       RETURNING *`,
+      [
+        passengerId, rideId, pickupStopId, dropStopId,
+        legs.map((l) => l.id), stopIds,
+        fare.baseFare, fare.distanceCharge, fare.poolDiscount, fare.total,
+        idempotencyKey ?? null,
+      ],
+    );
+    const request = inserted.rows[0];
+    if (!request) throw new Error("INSERT ... RETURNING produced no request row");
+
+    for (const [i, line] of fare.lines.entries()) {
+      await client.query(
+        `INSERT INTO fare_legs
+          (request_id, leg_no, leg_id, from_stop, to_stop, riders_on_leg, discount_pct, price_paisa, paid_paisa)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [request.id, i, line.edgeId, line.from, line.to, line.riders, line.discountPct, line.pricePaisa, line.paidPaisa],
+      );
+    }
+
+    // Everyone already aboard gets the new shared-leg discounts.
+    await recomputeRideFares(client, rideId);
+    await logEvent(client, { rideId, requestId: request.id, event: "JOINED", actorId: passengerId });
+
+    // Serialize through the transaction's client — the pool cannot see
+    // rows this transaction has not committed yet.
+    const freshRow = firstOrNull(
+      await client.query<RideRequestRow>("SELECT * FROM ride_requests WHERE id = $1", [request.id]),
+    );
+    const freshRide = firstOrNull(
+      await client.query<RideRow>("SELECT * FROM rides WHERE id = $1", [rideId]),
+    );
+    if (!freshRow || !freshRide) throw new Error("Ride or request disappeared mid-join");
+    return {
+      ride: serializeRide(freshRide),
+      request: serializeRequest(freshRow, await fareLinesForRequest(request.id, client)),
+      replayed: false,
+    };
+  });
+}
+
+/**
+ * Driver admits a pre-booked (REQUESTED) passenger into their own running
+ * ride — the counterpart to hop-on self-joining, for riders who requested
+ * before the trip existed. Same atomic seat claim, same reprice cascade.
+ */
+export async function admitRider({
+  driverId,
+  rideId,
+  requestId,
+}: {
+  driverId: string;
+  rideId: string;
+  requestId: string;
+}): Promise<{ ride: SerializedRide; request: SerializedRequest }> {
+  const vehicle = await requireVehicleForDriver(driverId);
+  if (!vehicle) throw forbidden("Driver has no vehicle registered");
+  await requireDriverOnline(driverId);
+
+  return withTransaction(async (client) => {
+    const current = firstOrNull(
+      await client.query<RideRow>("SELECT * FROM rides WHERE id = $1 FOR UPDATE", [rideId]),
+    );
+    if (!current) throw notFound("Ride not found");
+    if (current.vehicle_id !== vehicle.id) throw forbidden("Not your ride");
+    if (!ACTIVE_RIDE_STATUSES.includes(current.status)) {
+      throw conflict("RIDE_NOT_ACTIVE", "Ride is not taking riders");
+    }
+
+    const pending = firstOrNull(
       await client.query<RideRequestRow>("SELECT * FROM ride_requests WHERE id = $1 FOR UPDATE", [
         requestId,
       ]),
     );
-    if (!request) throw notFound("Request not found");
-    if (request.status !== "REQUESTED") {
+    if (!pending) throw notFound("Request not found");
+    if (pending.status !== "REQUESTED") {
       throw conflict("REQUEST_NO_LONGER_AVAILABLE", "Request is no longer available");
     }
 
-    // Pooling rule: overlap with at least one current member.
-    const { rows: members } = await client.query<{ leg_ids: string[] }>(
-      `SELECT leg_ids FROM ride_requests
-       WHERE ride_id = $1 AND status IN ('MATCHED', 'DRIVER_ARRIVED', 'STARTED')`,
-      [rideId],
-    );
-    const memberLegs = new Set(members.flatMap((m) => m.leg_ids));
-    if (!request.leg_ids.some((id) => memberLegs.has(id))) {
+    // Pooling rule: the rider's legs must overlap the trip that is running.
+    const members = await serializeRideMembers(rideId);
+    const memberLegs = new Set(members.flatMap((m) => m.legIds));
+    if (!pending.leg_ids.some((id) => memberLegs.has(id))) {
       throw conflict("NOT_POOLABLE", "Route does not overlap with the current trip");
     }
 
@@ -588,7 +861,7 @@ export async function joinRide({
     const claim = await client.query(
       `UPDATE rides SET seats_taken = seats_taken + $2, updated_at = now()
        WHERE id = $1 AND seats_taken + $2 <= capacity`,
-      [rideId, request.seats],
+      [rideId, pending.seats],
     );
     if (rowsAffected(claim) === 0) {
       throw conflict("RIDE_FULL", "Seat no longer available");
@@ -606,17 +879,16 @@ export async function joinRide({
     await recomputeRideFares(client, rideId);
     await logEvent(client, { rideId, requestId, event: "JOINED", actorId: driverId });
 
-    const updated = firstOrNull(
+    const freshRow = firstOrNull(
       await client.query<RideRequestRow>("SELECT * FROM ride_requests WHERE id = $1", [requestId]),
     );
     const freshRide = firstOrNull(
       await client.query<RideRow>("SELECT * FROM rides WHERE id = $1", [rideId]),
     );
-    if (!updated || !freshRide) throw new Error("Ride or request disappeared mid-join");
-
+    if (!freshRow || !freshRide) throw new Error("Ride or request disappeared mid-admit");
     return {
       ride: serializeRide(freshRide),
-      request: serializeRequest(updated, await fareLinesForRequest(requestId, client)),
+      request: serializeRequest(freshRow, await fareLinesForRequest(requestId, client)),
     };
   });
 }

@@ -1,10 +1,13 @@
 import "./env.js";
 import { beforeEach, afterAll, describe, expect, it } from "vitest";
-import { reseed, cleanup, api, get, post, token, requestOnR05, registerPassenger } from "./helpers.js";
+import { reseed, cleanup, api, get, post, token, requestOnR05, resetRateLimits } from "./helpers.js";
 import { query } from "../src/shared/db.js";
 import type { SerializedRequest, SerializedRide } from "../src/shared/types.js";
 
-beforeEach(reseed);
+beforeEach(() => {
+  reseed();
+  resetRateLimits();
+});
 afterAll(cleanup);
 
 interface SeatRow {
@@ -72,7 +75,7 @@ describe("pool capacity (PRD §11/§14)", () => {
   });
 
   it("lets exactly one of two concurrent joiners claim the last seat", async () => {
-    const { jashim, ride } = await rideWithSeats(2); // 2/3 used, one seat left
+    const { ride } = await rideWithSeats(2); // 2/3 used, one seat left
 
     // Two riders request overlapping legs at the same time.
     const [pa, pb] = await Promise.all([
@@ -89,18 +92,20 @@ describe("pool capacity (PRD §11/§14)", () => {
         role: "passenger",
       }),
     ]);
-    const [ra, rb] = await Promise.all([
-      requestOnR05(pa.data.token, "gulshan2", "gulshan1"),
-      requestOnR05(pb.data.token, "gulshan2", "gulshan1"),
-    ]);
-
-    // Both joins hit the server at the same instant.
+    // Both hop-on joins hit the server at the same instant (no pre-request —
+    // the joiner picks get-in/get-out stops on the running trip directly).
     const [joinA, joinB] = await Promise.all([
-      api("post", `/rides/${ride.id}/join`, { token: jashim, body: { requestId: ra.id } }),
-      api("post", `/rides/${ride.id}/join`, { token: jashim, body: { requestId: rb.id } }),
+      api("post", `/rides/${ride.id}/join`, {
+        token: pa.data.token,
+        body: { pickupStopId: "gulshan2", dropStopId: "gulshan1" },
+      }),
+      api("post", `/rides/${ride.id}/join`, {
+        token: pb.data.token,
+        body: { pickupStopId: "gulshan2", dropStopId: "gulshan1" },
+      }),
     ]);
 
-    expect([joinA.status, joinB.status].sort()).toEqual([200, 409]);
+    expect([joinA.status, joinB.status].sort()).toEqual([201, 409]);
     const loser = joinA.status === 409 ? joinA : joinB;
     expect(loser.data.error.code).toBe("RIDE_FULL");
 
@@ -134,26 +139,61 @@ describe("pool capacity (PRD §11/§14)", () => {
     expect(loser.data.error.code).toBe("REQUEST_NO_LONGER_AVAILABLE");
   });
 
-  it("rejects a mid-trip joiner whose route does not overlap", async () => {
-    const { jashim, ride } = await rideWithSeats(1);
+  it("rejects a joiner whose get-in/get-out are not on the trip", async () => {
+    const { ride } = await rideWithSeats(1);
 
-    // Shirin rides the Airport Road corridor — no shared leg with R05.
+    // Shirin is already aboard in rideWithSeats(1)? No — one seat only means
+    // Nusrat; Shirin is free to try, but picks stops off the Airport Road.
     const shirin = await token("shirin");
-    const s1 = await post(
-      "/rides/request",
-      { pickupStopId: "uttara_hb", dropStopId: "mohakhali", routeId: "R01" },
+    const join = await post(
+      `/rides/${ride.id}/join`,
+      { pickupStopId: "uttara_hb", dropStopId: "banani" },
       shirin,
     );
-    expect(s1.status).toBe(201);
-
-    const join = await post(`/rides/${ride.id}/join`, { requestId: s1.data.request.id }, jashim);
-    expect(join.status).toBe(409);
+    expect(join.status).toBe(400);
+    expect(join.data.error.code).toBe("BAD_REQUEST");
 
     const { rows } = await query<{ seats_taken: number }>(
       "SELECT seats_taken FROM rides WHERE id = $1",
       [ride.id],
     );
     expect(rows[0]?.seats_taken).toBe(1);
+  });
+
+  it("prices the joiner's preview at current occupancy and rejects impossible order", async () => {
+    const { ride } = await rideWithSeats(2); // two aboard, one seat free
+
+    const shirin = await token("shirin");
+    // The trip runs banani → gulshan1 on Nusrat's path; get-out before get-in is rejected.
+    const backwards = await get(
+      `/rides/${ride.id}/preview?pickupStopId=gulshan1&dropStopId=banani`,
+      shirin,
+    );
+    expect(backwards.status).toBe(400);
+
+    // A valid hop: gulshan1 → mohakhali is a single leg Nusrat already rides,
+    // so the joiner sees 2-rider pricing (20% off) at current occupancy.
+    const preview = await get(
+      `/rides/${ride.id}/preview?pickupStopId=gulshan1&dropStopId=mohakhali`,
+      shirin,
+    );
+    expect(preview.status).toBe(200);
+    expect(preview.data.seatsFree).toBe(1);
+    expect(preview.data.stops[0]).toBe("banani");
+    expect(preview.data.fare.lines).toHaveLength(1);
+    expect(preview.data.fare.lines[0]).toMatchObject({ riders: 2, discountPct: 20 });
+    expect(preview.data.fare.poolDiscount).toBe(
+      Math.round(preview.data.fare.lines[0].pricePaisa * 0.2),
+    );
+
+    // Passenger with an active ride cannot preview another join.
+    const nusrat = await token("nusrat");
+    const busy = await get(
+      `/rides/${ride.id}/preview?pickupStopId=gulshan1&dropStopId=mohakhali`,
+      nusrat,
+    );
+    expect(busy.status).toBe(409);
+    expect(busy.data.error.code).toBe("ACTIVE_RIDE_EXISTS");
   });
 
   it("cannot join a ride that is not active", async () => {
@@ -168,8 +208,11 @@ describe("pool capacity (PRD §11/§14)", () => {
       password: "secret1",
       role: "passenger",
     });
-    const req = await requestOnR05(late.data.token, "banani", "gulshan1");
-    const join = await post(`/rides/${ride.id}/join`, { requestId: req.id }, jashim);
+    const join = await post(
+      `/rides/${ride.id}/join`,
+      { pickupStopId: "gulshan2", dropStopId: "gulshan1" },
+      late.data.token,
+    );
     expect(join.status).toBe(409);
     expect(join.data.error.code).toBe("RIDE_NOT_ACTIVE");
   });
@@ -197,15 +240,8 @@ describe("offline enforcement", () => {
     const acc2 = await post("/rides/accept", { requestIds: [n1.id] }, jashim);
     expect(acc2.status).toBe(201);
 
-    // Mid-trip joins are seat claims too — blocked while offline.
-    await post("/driver/online", { online: false }, jashim);
-    const p = await registerPassenger("Offline Joiner");
-    const joiner = await requestOnR05(p.token, "gulshan2", "gulshan1");
-    const join = await post(`/rides/${acc2.data.ride.id}/join`, { requestId: joiner.id }, jashim);
-    expect(join.status).toBe(409);
-    expect(join.data.error.code).toBe("DRIVER_OFFLINE");
-
-    // The rejected claim left the ride untouched.
+    // The successful accept stands: one seat taken, nothing leaked from the
+    // rejected offline attempt.
     const { rows } = await query<SeatRow>(
       "SELECT seats_taken FROM rides WHERE id = $1",
       [acc2.data.ride.id],

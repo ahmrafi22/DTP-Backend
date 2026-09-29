@@ -20,7 +20,19 @@ export const cancelRideSchema = z.object({ reason: z.string().max(200).nullish()
 
 export const acceptRequestsSchema = z.object({ requestIds: z.array(z.string()).min(1).max(8) });
 
-export const joinRideSchema = z.object({ requestId: z.string().min(1) });
+export const admitRiderSchema = z.object({ requestId: z.string().min(1) });
+
+/** Hop-on: get-in/get-out picks from a running trip's stop list. */
+export const previewSchema = z.object({
+  pickupStopId: z.string().min(1),
+  dropStopId: z.string().min(1),
+});
+
+export const joinByStopsSchema = z.object({
+  pickupStopId: z.string().min(1),
+  dropStopId: z.string().min(1),
+  idempotencyKey: z.string().min(8).max(100).nullish(),
+});
 
 export const rateRideSchema = z.object({ rating: z.number().int().min(1).max(5) });
 
