@@ -1,6 +1,6 @@
 import "./env.js";
 import { beforeEach, afterAll, describe, expect, it } from "vitest";
-import { reseed, cleanup, api, get, post, token, requestOnR05 } from "./helpers.js";
+import { reseed, cleanup, api, get, post, token, requestOnR05, registerPassenger } from "./helpers.js";
 import { query } from "../src/shared/db.js";
 import type { SerializedRequest, SerializedRide } from "../src/shared/types.js";
 
@@ -172,5 +172,44 @@ describe("pool capacity (PRD §11/§14)", () => {
     const join = await post(`/rides/${ride.id}/join`, { requestId: req.id }, jashim);
     expect(join.status).toBe(409);
     expect(join.data.error.code).toBe("RIDE_NOT_ACTIVE");
+  });
+});
+
+describe("offline enforcement", () => {
+  it("lets an offline driver see requests but not claim seats", async () => {
+    const [nusrat, jashim] = await Promise.all([token("nusrat"), token("jashim")]);
+    const n1 = await requestOnR05(nusrat);
+
+    // Seed starts Jashim online; flip him off.
+    await post("/driver/online", { online: false }, jashim);
+
+    // Viewing is a demand preview and stays allowed while offline.
+    const view = await get("/driver/state", jashim);
+    expect(view.status).toBe(200);
+    expect(view.data.pendingGroups.length).toBeGreaterThan(0);
+
+    const acc = await post("/rides/accept", { requestIds: [n1.id] }, jashim);
+    expect(acc.status).toBe(409);
+    expect(acc.data.error.code).toBe("DRIVER_OFFLINE");
+
+    // The same accept succeeds once the driver goes online.
+    await post("/driver/online", { online: true }, jashim);
+    const acc2 = await post("/rides/accept", { requestIds: [n1.id] }, jashim);
+    expect(acc2.status).toBe(201);
+
+    // Mid-trip joins are seat claims too — blocked while offline.
+    await post("/driver/online", { online: false }, jashim);
+    const p = await registerPassenger("Offline Joiner");
+    const joiner = await requestOnR05(p.token, "gulshan2", "gulshan1");
+    const join = await post(`/rides/${acc2.data.ride.id}/join`, { requestId: joiner.id }, jashim);
+    expect(join.status).toBe(409);
+    expect(join.data.error.code).toBe("DRIVER_OFFLINE");
+
+    // The rejected claim left the ride untouched.
+    const { rows } = await query<SeatRow>(
+      "SELECT seats_taken FROM rides WHERE id = $1",
+      [acc2.data.ride.id],
+    );
+    expect(rows[0]?.seats_taken).toBe(1);
   });
 });

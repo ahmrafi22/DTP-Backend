@@ -464,6 +464,7 @@ export async function acceptRequests({
 
   const vehicle = await requireVehicleForDriver(driverId);
   if (!vehicle) throw forbidden("Driver has no vehicle registered");
+  await requireDriverOnline(driverId);
 
   const busy = await query(
     `SELECT 1 FROM rides WHERE vehicle_id = $1 AND status IN ('MATCHED', 'DRIVER_ARRIVED', 'STARTED') LIMIT 1`,
@@ -548,6 +549,7 @@ export async function joinRide({
   requestId: string;
 }): Promise<{ ride: SerializedRide; request: SerializedRequest }> {
   const vehicle = await requireVehicleForDriver(driverId);
+  await requireDriverOnline(driverId);
   const ride = await getRideById(rideId);
   if (!ride) throw notFound("Ride not found");
   if (ride.vehicle_id !== vehicle?.id) throw forbidden("Not your ride");
@@ -775,6 +777,18 @@ export async function rateRequest({
 
 export async function requireVehicleForDriver(driverId: string): Promise<VehicleRow | null> {
   return firstOrNull(await query<VehicleRow>("SELECT * FROM vehicles WHERE driver_id = $1", [driverId]));
+}
+
+/**
+ * Viewing pending requests is allowed while offline (a demand preview), but
+ * claiming seats is not — the offline toggle is enforced here, server-side,
+ * not just disabled in the UI.
+ */
+async function requireDriverOnline(driverId: string): Promise<void> {
+  const row = firstOrNull(await query<Pick<UserRow, "is_online">>("SELECT is_online FROM users WHERE id = $1", [driverId]));
+  if (!row?.is_online) {
+    throw conflict("DRIVER_OFFLINE", "Go online to accept rides");
+  }
 }
 
 /** Pending REQUESTED requests grouped greedily by shared legs (poolable). */
