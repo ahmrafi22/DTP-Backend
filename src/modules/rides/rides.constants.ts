@@ -40,3 +40,13 @@ export const TRIP_ACTIONS: ReadonlyArray<readonly [action: string, next: RideSta
   ["start", "STARTED"],
   ["complete", "COMPLETED"],
 ];
+
+/**
+ * Wait-and-Save window in seconds. The PRD promises 5 minutes of waiting for
+ * an extra 5% off; the demo runs it on a 30-second clock so the promise is
+ * watchable in a conversation (WAIT_AND_SAVE_SECONDS=300 for the real thing).
+ */
+export const WAIT_AND_SAVE_SECONDS = Number(process.env.WAIT_AND_SAVE_SECONDS ?? 30);
+
+/** Extra discount a honoured wait earns, as a percentage of distance charge. */
+export const WAIT_AND_SAVE_EXTRA_PCT = 5;

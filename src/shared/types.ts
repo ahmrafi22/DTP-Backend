@@ -104,6 +104,10 @@ export interface RideRequestRow extends QueryResultRow {
   idempotency_key: string | null;
   rating: number | null;
   cancel_reason: string | null;
+  declined_by: string[];
+  wait_and_save: boolean;
+  wait_deadline: Date | null;
+  wait_decided_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -234,6 +238,12 @@ export interface SerializedRequest {
   status: RequestStatus;
   rating: number | null;
   cancelReason: string | null;
+  /** Wait-and-Save: the passenger agreed to wait out the deadline for −5%. */
+  waitAndSave: boolean;
+  /** When the wait promise runs out (null unless accepted). */
+  waitDeadline: Date | null;
+  /** The rider has answered the offer either way — stop showing it. */
+  waitDecided: boolean;
   fare: Fare;
   createdAt: Date;
   updatedAt: Date;

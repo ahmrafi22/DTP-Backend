@@ -32,6 +32,8 @@ import type {
 } from "../../shared/types.js";
 import {
   ACTIVE_RIDE_STATUSES,
+  WAIT_AND_SAVE_EXTRA_PCT,
+  WAIT_AND_SAVE_SECONDS,
   ALLOWED_NEXT,
   isCancellable,
 } from "./rides.constants.js";
@@ -194,6 +196,9 @@ export function serializeRequest(
     status: row.status,
     rating: row.rating,
     cancelReason: row.cancel_reason,
+    waitAndSave: row.wait_and_save,
+    waitDeadline: row.wait_deadline,
+    waitDecided: row.wait_decided_at !== null,
     fare: fareFromRow(row, lines),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -522,7 +527,7 @@ export async function acceptRequests({
 
     for (const req of locked) {
       const res = await client.query(
-        `UPDATE ride_requests SET status = 'MATCHED', ride_id = $2, updated_at = now()
+        `UPDATE ride_requests SET status = 'MATCHED', ride_id = $2, declined_by = '{}', updated_at = now()
          WHERE id = $1 AND status = 'REQUESTED'`,
         [req.id, ride.id],
       );
@@ -900,6 +905,179 @@ export async function admitRider({
   });
 }
 
+// ---------- driver decline, wait-and-save, passenger finish ----------
+
+/**
+ * Driver declines a pending request: it disappears from THEIR pending list
+ * but stays open for every other driver — the pool isn't one driver's to kill.
+ */
+export async function declineRequest({
+  driverId,
+  requestId,
+}: {
+  driverId: string;
+  requestId: string;
+}): Promise<{ requestId: string; declined: true }> {
+  return withTransaction(async (client) => {
+    const row = firstOrNull(
+      await client.query<RideRequestRow>("SELECT * FROM ride_requests WHERE id = $1 FOR UPDATE", [requestId]),
+    );
+    if (!row) throw notFound("Request not found");
+    if (row.status !== "REQUESTED") {
+      throw conflict("REQUEST_NO_LONGER_AVAILABLE", "Request is no longer available");
+    }
+    await client.query(
+      `UPDATE ride_requests SET declined_by = array_append(declined_by, $2), updated_at = now()
+       WHERE id = $1`,
+      [requestId, driverId],
+    );
+    await logEvent(client, { requestId, event: "DECLINED", actorId: driverId });
+    return { requestId, declined: true };
+  });
+}
+
+/**
+ * Wait-and-Save: after being matched, the passenger may hold their seat for
+ * a short window (demo 30s) to earn an extra 5% off — the driver gets time to
+ * fill the car, the rider gets a better deal. Answerable once; the promise is
+ * only honoured if it runs out before the trip completes.
+ */
+export async function setWaitAndSave({
+  passengerId,
+  requestId,
+  accept,
+}: {
+  passengerId: string;
+  requestId: string;
+  accept: boolean;
+}): Promise<SerializedRequest> {
+  const request = await getRequestById(requestId);
+  if (!request) throw notFound("Ride request not found");
+  if (request.passenger_id !== passengerId) throw forbidden("You can only change your own ride");
+  if (request.status !== "MATCHED" && request.status !== "DRIVER_ARRIVED") {
+    throw conflict("OFFER_CLOSED", "The wait-and-save offer only applies before the trip starts");
+  }
+  if (request.wait_decided_at) {
+    throw conflict("ALREADY_DECIDED", "You have already answered the wait-and-save offer");
+  }
+
+  const deadline = accept ? new Date(Date.now() + WAIT_AND_SAVE_SECONDS * 1000) : null;
+  await query(
+    `UPDATE ride_requests
+     SET wait_and_save = $2, wait_deadline = $3, wait_decided_at = now(), updated_at = now()
+     WHERE id = $1`,
+    [requestId, accept, deadline],
+  );
+  await withTransaction(async (client) => {
+    await logEvent(client, {
+      requestId,
+      rideId: request.ride_id,
+      event: accept ? "WAIT_AND_SAVE_ACCEPTED" : "WAIT_AND_SAVE_DECLINED",
+      actorId: passengerId,
+      meta: accept ? { seconds: WAIT_AND_SAVE_SECONDS, extraPct: WAIT_AND_SAVE_EXTRA_PCT } : null,
+    });
+  });
+  const fresh = await serializeRequestById(requestId);
+  if (!fresh) throw notFound("Ride request not found");
+  return fresh;
+}
+
+/**
+ * Honour every honoured wait on the ride: each member who accepted
+ * Wait-and-Save and whose deadline passed before this instant gets an extra
+ * WAIT_AND_SAVE_EXTRA_PCT off their distance charge (folded into
+ * pool_discount_paisa so base + distance − discount still reconciles).
+ */
+async function applyWaitAndSave(client: DbClient, rideId: string): Promise<number> {
+  const { rows } = await client.query<RideRequestRow>(
+    `SELECT * FROM ride_requests
+     WHERE ride_id = $1 AND wait_and_save = TRUE AND wait_deadline IS NOT NULL
+       AND wait_deadline <= now()`,
+    [rideId],
+  );
+  for (const row of rows) {
+    if (row.pool_discount_paisa >= Math.round((row.distance_charge_paisa * 100) / 90)) {
+      // Already carries the wait discount (90% of distance): never double-apply.
+      continue;
+    }
+    const extra = Math.round((row.distance_charge_paisa * WAIT_AND_SAVE_EXTRA_PCT) / 100);
+    const discount = row.pool_discount_paisa + extra;
+    await client.query(
+      `UPDATE ride_requests
+       SET pool_discount_paisa = $2, total_fare_paisa = $3, updated_at = now()
+       WHERE id = $1`,
+      [row.id, discount, row.base_fare_paisa + row.distance_charge_paisa - discount],
+    );
+    await logEvent(client, {
+      rideId,
+      requestId: row.id,
+      event: "WAIT_AND_SAVE_APPLIED",
+      meta: { extraPaisa: extra },
+    });
+  }
+  return rows.length;
+}
+
+/**
+ * Passenger marks their own leg finished ("I'm out at my stop"). Their
+ * membership completes and leaves the seat pool; when nobody is left riding,
+ * the whole ride completes.
+ */
+export async function finishRideForPassenger({
+  passengerId,
+  requestId,
+}: {
+  passengerId: string;
+  requestId: string;
+}): Promise<{ request: SerializedRequest; ride: SerializedRide }> {
+  return withTransaction(async (client) => {
+    const row = firstOrNull(
+      await client.query<RideRequestRow>("SELECT * FROM ride_requests WHERE id = $1 FOR UPDATE", [requestId]),
+    );
+    if (!row) throw notFound("Ride request not found");
+    if (row.passenger_id !== passengerId) throw forbidden("You can only finish your own ride");
+    if (row.status !== "STARTED" && row.status !== "MATCHED" && row.status !== "DRIVER_ARRIVED") {
+      throw conflict("NOT_IN_PROGRESS", "This ride is not in progress");
+    }
+    const rideId = row.ride_id;
+    if (!rideId) throw conflict("NOT_IN_PROGRESS", "This ride is not in progress");
+
+    await client.query(
+      `UPDATE ride_requests SET status = 'COMPLETED', updated_at = now() WHERE id = $1`,
+      [requestId],
+    );
+    await applyWaitAndSave(client, rideId);
+    await logEvent(client, { rideId, requestId, event: "DROPPED_OFF", actorId: passengerId });
+
+    const { rowCount: left } = await client.query(
+      `SELECT 1 FROM ride_requests
+       WHERE ride_id = $1 AND status IN ('MATCHED', 'DRIVER_ARRIVED', 'STARTED') LIMIT 1`,
+      [rideId],
+    );
+    let ride = firstOrNull(
+      await client.query<RideRow>("SELECT * FROM rides WHERE id = $1", [rideId]),
+    );
+    if (left === 0 && ride) {
+      await client.query(
+        `UPDATE rides SET status = 'COMPLETED', updated_at = now() WHERE id = $1`,
+        [rideId],
+      );
+      await logEvent(client, { rideId, event: "COMPLETED" });
+      ride = firstOrNull(await client.query<RideRow>("SELECT * FROM rides WHERE id = $1", [rideId]));
+    }
+    if (!ride) throw new Error("Ride disappeared mid-finish");
+    // Read through the transaction client — the pool cannot see our writes yet.
+    const freshRow = firstOrNull(
+      await client.query<RideRequestRow>("SELECT * FROM ride_requests WHERE id = $1", [requestId]),
+    );
+    if (!freshRow) throw new Error("Request disappeared mid-finish");
+    return {
+      request: serializeRequest(freshRow, await fareLinesForRequest(requestId, client)),
+      ride: serializeRide(ride),
+    };
+  });
+}
+
 /**
  * Passenger cancel (PRD §4): allowed from REQUESTED through DRIVER_ARRIVED.
  * Frees the seat, reprices remaining riders, cancels an unstarted ride that
@@ -1021,6 +1199,7 @@ export async function advanceRide({
       [rideId, next],
     );
     await logEvent(client, { rideId, event: next, actorId: driverId });
+    if (next === "COMPLETED") await applyWaitAndSave(client, rideId);
 
     const fresh = firstOrNull(
       await client.query<RideRow>("SELECT * FROM rides WHERE id = $1", [rideId]),
@@ -1071,11 +1250,16 @@ async function requireDriverOnline(driverId: string): Promise<void> {
 }
 
 /** Pending REQUESTED requests grouped greedily by shared legs (poolable). */
-export async function pendingPoolGroups(): Promise<PoolGroup[]> {
+export async function pendingPoolGroups(viewerDriverId?: string): Promise<PoolGroup[]> {
+  // A request a driver declined vanishes from THEIR list only — it stays open
+  // for every other driver, and the first accept anywhere claims it.
   const { rows } = await query<RideRequestWithNameRow>(
     `SELECT r.*, u.name AS passenger_name FROM ride_requests r
      JOIN users u ON u.id = r.passenger_id
-     WHERE r.status = 'REQUESTED' ORDER BY r.created_at`,
+     WHERE r.status = 'REQUESTED'
+       AND NOT ($1::text IS NULL OR r.declined_by @> ARRAY[$1::text])
+     ORDER BY r.created_at`,
+    [viewerDriverId ?? null],
   );
 
   const groups: RideRequestWithNameRow[][] = [];
@@ -1106,7 +1290,7 @@ export async function driverState(driverId: string): Promise<DriverState> {
     ),
   );
   const members = activeRide ? await serializeRideMembers(activeRide.id) : [];
-  const groups = await pendingPoolGroups();
+  const groups = await pendingPoolGroups(driverId);
 
   const earnings = firstOrNull(
     await query<EarningsRow>(

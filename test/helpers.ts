@@ -99,8 +99,9 @@ export const loginAs = (id: string): string | null =>
     nusrat: "+880 171 0001001",
     rafiq: "+880 171 0001002",
     shirin: "+880 171 0001003",
-    jashim: "+880 181 0002001",
-    kabir: "+880 181 0002002",
+    // Driver phones follow the 15-auto seed order: bullet is #2, rocket #3.
+    jashim: "+880 181 0002002",
+    kabir: "+880 181 0002003",
     admin: "+880 191 0009001",
   })[id] ?? null;
 

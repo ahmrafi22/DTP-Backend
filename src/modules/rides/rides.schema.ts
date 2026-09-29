@@ -36,6 +36,8 @@ export const joinByStopsSchema = z.object({
 
 export const rateRideSchema = z.object({ rating: z.number().int().min(1).max(5) });
 
+export const waitAndSaveSchema = z.object({ accept: z.boolean() });
+
 export const setOnlineSchema = z.object({ online: z.boolean() });
 
 export type RequestRideInput = z.infer<typeof requestRideSchema>;

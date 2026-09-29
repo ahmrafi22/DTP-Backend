@@ -7,6 +7,7 @@ export {
   previewSchema,
   rateRideSchema,
   setOnlineSchema,
+  waitAndSaveSchema,
 } from "./rides.schema.js";
 export {
   ALLOWED_NEXT,
@@ -29,6 +30,9 @@ export {
   joinPreview,
   joinRideByStops,
   admitRider,
+  declineRequest,
+  finishRideForPassenger,
+  setWaitAndSave,
   passengerHistory,
   pendingPoolGroups,
   rateRequest,

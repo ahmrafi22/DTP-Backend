@@ -10,9 +10,11 @@ import {
   advanceRide,
   cancelRequest,
   createRequest,
+  declineRequest,
   driverHistory,
   driverState,
   eventsForRide,
+  finishRideForPassenger,
   getRequestById,
   getRideById,
   admitRider,
@@ -23,6 +25,7 @@ import {
   rateRequest,
   requireVehicleForDriver,
   serializeRequestById,
+  setWaitAndSave,
 } from "./rides.service.js";
 import { param } from "../../shared/http.js";
 import { TRIP_ACTIONS } from "./rides.constants.js";
@@ -35,6 +38,7 @@ import {
   rateRideSchema,
   requestRideSchema,
   setOnlineSchema,
+  waitAndSaveSchema,
 } from "./rides.schema.js";
 
 export const ridesRouter = Router();
@@ -129,6 +133,48 @@ ridesRouter.post(
       rating: body.rating,
     });
     res.json({ request });
+  }),
+);
+
+// Driver declines a pending request — it leaves THEIR list, stays open for
+// the other drivers.
+ridesRouter.post(
+  "/rides/:id/decline",
+  authenticate,
+  requireRole("driver"),
+  asyncHandler(async (req, res) => {
+    res.json(await declineRequest({ driverId: req.user.id, requestId: param(req, "id") }));
+  }),
+);
+
+// Wait-and-Save: the matched passenger holds their seat for the window to
+// earn an extra 5% off (demo clock: 30 seconds).
+ridesRouter.post(
+  "/rides/:id/wait-and-save",
+  authenticate,
+  requireRole("passenger"),
+  asyncHandler(async (req, res) => {
+    const body = waitAndSaveSchema.parse(req.body);
+    res.json({
+      request: await setWaitAndSave({
+        passengerId: req.user.id,
+        requestId: param(req, "id"),
+        accept: body.accept,
+      }),
+    });
+  }),
+);
+
+// "I am out at my stop" — the passenger completes their own leg; the ride
+// completes when nobody is left riding.
+ridesRouter.post(
+  "/rides/:id/finish",
+  authenticate,
+  requireRole("passenger"),
+  asyncHandler(async (req, res) => {
+    res.json(
+      await finishRideForPassenger({ passengerId: req.user.id, requestId: param(req, "id") }),
+    );
   }),
 );
 
