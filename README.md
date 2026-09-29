@@ -28,6 +28,10 @@ npm run dev               # tsx watch, http://localhost:4000
 npm test                  # vitest (reseeds per suite, runs sequentially)
 ```
 
+**Before `npm test`:** the suites share this database with a running dev
+server, whose auto-shuttle scheduler would keep writing trips mid-test. Stop
+`npm run dev` first, or start it with `SHUTTLE_SCHEDULER=off`.
+
 Production path:
 
 ```bash
@@ -101,6 +105,27 @@ test/               4 suites, 28 tests
 
 Errors use `{error: {code, message, details?}}` with 400/401/403/404/409/429.
 
+## The living map (auto-shuttles)
+
+Every fleet auto is a real driver account with a vehicle, a home stop, a map
+color and a home corridor. A small scheduler (15s tick,
+`src/modules/map/shuttle.ts`) keeps **~3 randomly chosen autos running at all
+times**: it starts a trip in a random direction on the driver's corridor,
+boards 0–3 regular commuters on random slices of the path (occupancy follows
+the Dhaka time band — rush hours fill up, late night runs emptier), brings the
+driver online, and completes the trip into history when the path time is up.
+The ride's path lives on the ride (`rides.stop_ids`), so even an empty shuttle
+has a route and stays joinable: tap the auto, pick **Get in at / Get out at**
+(stops the auto has already passed are hidden), watch your fare settle live,
+claim the seat.
+
+```
+GET  /map/live           one snapshot of the whole fleet (1s cache)
+GET  /rides/:id/preview   price a hop-on at the current occupancy
+POST /rides/:id/join      claim a seat with get-in/get-out stops
+POST /rides/:id/admit     driver admits a pre-booked rider mid-trip
+```
+
 ## Key decisions
 
 **Seat locking (PRD §11).** Joining a ride claims seats with one atomic
@@ -157,7 +182,7 @@ The rest is structural:
   `string | string[] | undefined`; the helper turns a shape mismatch into a
   400 rather than `"[object Object]"` reaching a SQL query.
 
-## Tests (28)
+## Tests (33)
 
 - PRD §6 worked example: 410/150/230 per-leg fares with ৳100 legs
 - Nusrat + Rafiq pooled on R05: shared legs 20% off, solo estimate intact

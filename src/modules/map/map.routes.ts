@@ -71,15 +71,24 @@ export async function liveRideFor(rideId: string): Promise<{ live: MapLiveRide |
   );
   const members = memberRows.rows;
   const primary = members[0];
-  if (!primary) return { live: null };
+  if (!primary && !(ride.stop_ids && ride.stop_ids.length >= 2)) return { live: null };
 
-  const legDurations = primary.leg_ids.length
+  const stopIds =
+    ride.stop_ids && ride.stop_ids.length >= 2 ? ride.stop_ids : primary?.stop_ids ?? [];
+
+  const pathLegIds = stopIds.reduce((ids: string[], stop, i) => {
+    if (i === 0) return ids;
+    const key = [stopIds[i - 1], stop].sort().join("~");
+    if (!ids.includes(key)) ids.push(key);
+    return ids;
+  }, []);
+  const legDurations = pathLegIds.length
     ? await query<LegDurationRow>(
         `SELECT id, duration_min FROM legs WHERE id = ANY($1::text[])`,
-        [primary.leg_ids],
+        [pathLegIds],
       )
     : { rows: [] as LegDurationRow[] };
-  const totalSec = primary.leg_ids.reduce(
+  const totalSec = pathLegIds.reduce(
     (sum, id) => sum + (legDurations.rows.find((l) => l.id === id)?.duration_min ?? 0),
     0,
   ) * 60;
@@ -99,7 +108,7 @@ export async function liveRideFor(rideId: string): Promise<{ live: MapLiveRide |
     live: {
       id: ride.id,
       status: ride.status,
-      stopIds: primary.stop_ids,
+      stopIds,
       progress,
       totalSec,
       passengers: members.map((m) => ({
@@ -166,7 +175,29 @@ export async function mapLive(): Promise<MapLivePayload> {
       primaryByRide.set(row.ride_id ?? "", row);
     }
   }
-  const primaryLegIds = [...primaryByRide.values()].flatMap((m) => m.leg_ids);
+  const pathByRide = new Map<string, string[]>();
+  for (const ride of activeRides) {
+    pathByRide.set(
+      ride.id,
+      ride.stop_ids && ride.stop_ids.length >= 2 ? ride.stop_ids : primaryByRide.get(ride.id)?.stop_ids ?? [],
+    );
+  }
+  const legIdsOf = (stopIds: string[]): string[] => {
+    const ids: string[] = [];
+    for (let i = 1; i < stopIds.length; i += 1) {
+      const a = stopIds[i - 1];
+      const b = stopIds[i];
+      if (a && b) ids.push([a, b].sort().join("~"));
+    }
+    return ids;
+  };
+  const pathLegIdsByRide = new Map<string, string[]>();
+  const primaryLegIds: string[] = [];
+  for (const [rideId, stopIds] of pathByRide) {
+    const ids = legIdsOf(stopIds);
+    pathLegIdsByRide.set(rideId, ids);
+    primaryLegIds.push(...ids);
+  }
   const legDurations = new Map<string, number>();
   if (primaryLegIds.length) {
     const { rows } = await query<LegDurationRow>(
@@ -194,10 +225,11 @@ export async function mapLive(): Promise<MapLivePayload> {
     const ride = rideByVehicle.get(row.vehicle_id);
     let live: MapLiveRide | null = null;
     if (ride) {
-      const primary = primaryByRide.get(ride.id);
       const members = membersByRide.get(ride.id) ?? [];
-      const totalSec =
-        (primary?.leg_ids ?? []).reduce((sum, id) => sum + (legDurations.get(id) ?? 0), 0) * 60;
+      const totalSec = (pathLegIdsByRide.get(ride.id) ?? []).reduce(
+        (sum, id) => sum + (legDurations.get(id) ?? 0),
+        0,
+      ) * 60;
       const startedAt = startedAtByRide.get(ride.id);
       const elapsedSec = startedAt ? Math.max(0, (now - startedAt.getTime()) / 1000) : 0;
       const progress =
@@ -207,7 +239,7 @@ export async function mapLive(): Promise<MapLivePayload> {
       live = {
         id: ride.id,
         status: ride.status,
-        stopIds: primary?.stop_ids ?? [],
+        stopIds: pathByRide.get(ride.id) ?? [],
         progress,
         totalSec,
         passengers: members.map((m) => ({
@@ -225,7 +257,7 @@ export async function mapLive(): Promise<MapLivePayload> {
       vehicleName: row.vehicle_name,
       color: row.color,
       online: row.is_online,
-      phase: !row.is_online ? "offline" : ride ? "onboard" : "waiting",
+      phase: ride ? "onboard" : row.is_online ? "waiting" : "offline",
       baseStopId: row.base_stop_id,
       seatsTaken: ride?.seats_taken ?? 0,
       capacity: row.capacity,

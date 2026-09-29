@@ -208,9 +208,18 @@ export function serializeRide(row: RideRow): SerializedRide {
     status: row.status,
     seatsTaken: row.seats_taken,
     capacity: row.capacity,
+    stopIds: row.stop_ids ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+/** The path a ride is driving: the ride's own path, else its primary rider's. */
+export async function ridePath(ride: RideRow): Promise<string[]> {
+  if (ride.stop_ids && ride.stop_ids.length >= 2) return ride.stop_ids;
+  const members = await serializeRideMembers(ride.id);
+  const primary = members[0];
+  return primary?.stopIds ?? [];
 }
 
 /**
@@ -572,7 +581,9 @@ function resolveJoinSlice(
   if (pickupIndexes.length === 0 || dropIndexes.length === 0) {
     throw badRequest("Get-in and get-out must be stops on this trip", { stops: path });
   }
-  const minGetIn = Math.ceil(progress * (path.length - 1));
+  // The stop the auto is at or just left stays selectable (floor): boarding
+  // as it pulls away is friendlier than a strict "already passed" dead end.
+  const minGetIn = Math.floor(progress * (path.length - 1));
   const pickup = pickupIndexes.find((i) => i >= minGetIn);
   const drop = dropIndexes[dropIndexes.length - 1];
   if (pickup === undefined) {
@@ -652,16 +663,14 @@ export async function joinPreview({
   );
   if (active) throw conflict("ACTIVE_RIDE_EXISTS", "You are already on a ride");
 
-  const members = await serializeRideMembers(rideId);
-  if (members.length === 0) throw conflict("RIDE_EMPTY", "This ride has no riders yet");
   const vehicle = await vehicleById(ride.vehicle_id);
   if (!vehicle) throw notFound("Ride vehicle disappeared");
 
-  const primary = members[0];
-  if (!primary) throw conflict("RIDE_EMPTY", "This ride has no riders yet");
+  const path = await ridePath(ride);
+  if (path.length < 2) throw conflict("RIDE_EMPTY", "This ride has no route yet");
   const { live } = await liveRideFor(rideId);
   const { legs } = resolveJoinSlice(
-    primary.stopIds,
+    path,
     pickupStopId,
     dropStopId,
     live?.progress ?? 0,
@@ -675,7 +684,7 @@ export async function joinPreview({
 
   return {
     ride: serializeRide(ride),
-    stops: primary.stopIds,
+    stops: path,
     seatsFree: vehicle.capacity - ride.seats_taken,
     fare: priceLegs(legs, joinerRidersPerLeg),
   };
@@ -733,16 +742,14 @@ export async function joinRideByStops({
     );
     if (active) throw conflict("ACTIVE_RIDE_EXISTS", "You are already on a ride");
 
-    const members = await serializeRideMembers(rideId);
-    const primary = members[0];
-    if (!primary) throw conflict("RIDE_EMPTY", "This ride has no riders yet");
-
     const vehicle = await vehicleById(current.vehicle_id);
     if (!vehicle) throw notFound("Ride vehicle disappeared");
 
+    const path = await ridePath(current);
+    if (path.length < 2) throw conflict("RIDE_EMPTY", "This ride has no route yet");
     const { live } = await liveRideFor(rideId);
     const { legs, stopIds } = resolveJoinSlice(
-      primary.stopIds,
+      path,
       pickupStopId,
       dropStopId,
       live?.progress ?? 0,

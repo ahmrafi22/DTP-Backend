@@ -80,6 +80,8 @@ export interface RideRow extends QueryResultRow {
   status: RideStatus;
   seats_taken: number;
   capacity: number;
+  /** The path being driven — set by shuttles; rider paths derive from members. */
+  stop_ids: string[] | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -245,6 +247,8 @@ export interface SerializedRide {
   status: RideStatus;
   seatsTaken: number;
   capacity: number;
+  /** The driven path when the ride defines one (shuttles); else null. */
+  stopIds: string[] | null;
   createdAt: Date;
   updatedAt: Date;
 }

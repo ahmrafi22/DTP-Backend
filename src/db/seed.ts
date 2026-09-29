@@ -66,6 +66,8 @@ interface SeedVehicle {
   color: string;
   base: string;
   capacity?: number;
+  /** Set on shuttle autos: they keep cycling this predefined route all day. */
+  corridor?: string;
 }
 
 /**
@@ -73,18 +75,18 @@ interface SeedVehicle {
  * always shown, now real accounts. `stands` never leave their base stop.
  */
 const FLEET: SeedVehicle[] = [
-  { id: "pahar", driverId: "jahir", name: "Pahar", color: "#475569", base: "airport" },
-  { id: "bullet", driverId: "jashim", name: "Bullet", color: "#2563eb", base: "mirpur10" },
-  { id: "rocket", driverId: "kabir", name: "Rocket", color: "#9333ea", base: "uttara_hb" },
-  { id: "bijoy", driverId: "selim", name: "Bijoy", color: "#d97706", base: "mirpur12" },
-  { id: "rocky", driverId: "rashid", name: "Rocky", color: "#059669", base: "banani" },
-  { id: "speed", driverId: "salma", name: "Speed", color: "#0891b2", base: "dhanmondi27" },
-  { id: "jontro", driverId: "rakib", name: "Jontro", color: "#65a30d", base: "moghbazar" },
-  { id: "tornado", driverId: "habib", name: "Tornado", color: "#ea580c", base: "shyamoli" },
-  { id: "raja", driverId: "nasir", name: "Raja", color: "#e11d48", base: "malibagh" },
-  { id: "duronto", driverId: "aminul", name: "Duronto", color: "#7c3aed", base: "gulistan" },
-  { id: "chalo", driverId: "mizan", name: "Chalo", color: "#db2777", base: "new_market" },
-  { id: "tara", driverId: "ruma", name: "Tara", color: "#0d9488", base: "sadarghat" },
+  { id: "pahar", driverId: "jahir", name: "Pahar", color: "#475569", base: "airport", corridor: "R03" },
+  { id: "bullet", driverId: "jashim", name: "Bullet", color: "#2563eb", base: "mirpur10", corridor: "R18" },
+  { id: "rocket", driverId: "kabir", name: "Rocket", color: "#9333ea", base: "uttara_hb", corridor: "R01" },
+  { id: "bijoy", driverId: "selim", name: "Bijoy", color: "#d97706", base: "mirpur12", corridor: "R20" },
+  { id: "rocky", driverId: "rashid", name: "Rocky", color: "#059669", base: "banani", corridor: "R05" },
+  { id: "speed", driverId: "salma", name: "Speed", color: "#0891b2", base: "dhanmondi27", corridor: "R15" },
+  { id: "jontro", driverId: "rakib", name: "Jontro", color: "#65a30d", base: "moghbazar", corridor: "R14" },
+  { id: "tornado", driverId: "habib", name: "Tornado", color: "#ea580c", base: "shyamoli", corridor: "R16" },
+  { id: "raja", driverId: "nasir", name: "Raja", color: "#e11d48", base: "malibagh", corridor: "R08" },
+  { id: "duronto", driverId: "aminul", name: "Duronto", color: "#7c3aed", base: "gulistan", corridor: "R10" },
+  { id: "chalo", driverId: "mizan", name: "Chalo", color: "#db2777", base: "new_market", corridor: "R23" },
+  { id: "tara", driverId: "ruma", name: "Tara", color: "#0d9488", base: "sadarghat", corridor: "R29" },
   { id: "rustom", driverId: "sohel", name: "Rustom", color: "#64748b", base: "gulshan2" },
   { id: "shahin", driverId: "polash", name: "Shahin", color: "#78716c", base: "azimpur" },
   { id: "jony", driverId: "babul", name: "Jony", color: "#52525b", base: "kamalapur" },
@@ -188,17 +190,37 @@ export async function seed(): Promise<void> {
       })),
       { id: "admin", name: "Demo Admin", phone: "+880 191 0009001", role: "admin", home: null, usualDrop: null, online: false },
     ];
+    // ---------- regular commuters the shuttles pick up along the way ----------
+    const commuters = [
+      { id: "rina", name: "Rina", phone: "+880 172 0003001", home: "banani", usualDrop: "mohakhali" },
+      { id: "jamil", name: "Jamil", phone: "+880 172 0003002", home: "gulshan1", usualDrop: "banani" },
+      { id: "mithu", name: "Mithu", phone: "+880 172 0003003", home: "mohakhali", usualDrop: "banani" },
+      { id: "farhana", name: "Farhana", phone: "+880 172 0003004", home: "uttara_hb", usualDrop: "mohakhali" },
+      { id: "imran", name: "Imran", phone: "+880 172 0003005", home: "kurmitola", usualDrop: "gulshan1" },
+      { id: "nazma", name: "Nazma", phone: "+880 172 0003006", home: "farmgate", usualDrop: "motijheel" },
+      { id: "tuhin", name: "Tuhin", phone: "+880 172 0003007", home: "mirpur10", usualDrop: "gabtoli" },
+      { id: "reyza", name: "Reyza", phone: "+880 172 0003008", home: "gabtoli", usualDrop: "mirpur10" },
+      { id: "sumon", name: "Sumon", phone: "+880 172 0003009", home: "paltan", usualDrop: "motijheel" },
+      { id: "nasrin", name: "Nasrin", phone: "+880 172 0003010", home: "motijheel", usualDrop: "gulistan" },
+      { id: "hasan", name: "Hasan", phone: "+880 172 0003011", home: "kamalapur", usualDrop: "motijheel" },
+      { id: "dola", name: "Dola", phone: "+880 172 0003012", home: "dhanmondi27", usualDrop: "moghbazar" },
+      { id: "rabbil", name: "Rabbil", phone: "+880 172 0003013", home: "rampura", usualDrop: "malibagh" },
+      { id: "shiuly", name: "Shiuly", phone: "+880 172 0003014", home: "sadarghat", usualDrop: "gulistan" },
+    ];
     await bulkInsert(
       client,
       "users",
       ["id", "name", "phone", "password_hash", "role", "home_stop_id", "usual_drop_stop_id", "is_online"],
-      users.map((u) => [u.id, u.name, u.phone, hash, u.role, u.home, u.usualDrop, u.online]),
+      [
+        ...users.map((u) => [u.id, u.name, u.phone, hash, u.role, u.home, u.usualDrop, u.online]),
+        ...commuters.map((c) => [c.id, c.name, c.phone, hash, "passenger", c.home, c.usualDrop, false]),
+      ],
     );
     await bulkInsert(
       client,
       "vehicles",
-      ["id", "driver_id", "name", "capacity", "base_stop_id", "color"],
-      FLEET.map((v) => [v.id, v.driverId, v.name, v.capacity ?? 3, v.base, v.color]),
+      ["id", "driver_id", "name", "capacity", "base_stop_id", "color", "corridor_route_id"],
+      FLEET.map((v) => [v.id, v.driverId, v.name, v.capacity ?? 3, v.base, v.color, v.corridor ?? null]),
     );
 
     // ---------- history: the same commute, different drivers each day ----------
@@ -252,10 +274,13 @@ export async function seed(): Promise<void> {
         if (!fare) throw new Error(`Seed fare missing for ${m.requestId}`);
         faresByRequest.set(m.requestId, fare);
       });
+      const primaryMember = ride.members[0];
+      if (!primaryMember) throw new Error(`Seed ride ${ride.id} has no members`);
+      const path = primaryMember.stopIds;
       await client.query(
-        `INSERT INTO rides (id, vehicle_id, status, seats_taken, capacity, created_at, updated_at)
-         VALUES ($1, $2, 'COMPLETED', $3, 3, $4, $4)`,
-        [ride.id, ride.vehicleId, ride.members.length, ride.at],
+        `INSERT INTO rides (id, vehicle_id, status, seats_taken, capacity, stop_ids, created_at, updated_at)
+         VALUES ($1, $2, 'COMPLETED', $3, 3, $4, $5, $5)`,
+        [ride.id, ride.vehicleId, ride.members.length, path, ride.at],
       );
     }
 
