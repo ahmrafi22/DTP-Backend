@@ -79,6 +79,15 @@ export interface RideRow extends QueryResultRow {
   capacity: number;
   created_at: Date;
   updated_at: Date;
+  /**
+   * Written once, when the ride entered STARTED, and never touched again.
+   *
+   * `updated_at` cannot anchor the trip clock: it moves on every later
+   * transition, so two browsers polling either side of a drop-off would draw
+   * the auto in different places. This is the one instant every client agrees
+   * on, which is what makes the position identical across sessions.
+   */
+  started_at: Date | null;
 }
 
 export interface RideRequestRow extends QueryResultRow {
@@ -255,6 +264,8 @@ export interface SerializedRide {
   capacity: number;
   createdAt: Date;
   updatedAt: Date;
+  /** Immutable STARTED instant; the anchor for the trip clock. Null if never started. */
+  startedAt: Date | null;
 }
 
 /**

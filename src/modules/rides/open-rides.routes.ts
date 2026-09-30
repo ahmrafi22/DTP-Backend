@@ -32,7 +32,11 @@ const hopOnSchema = z.object({
   pickupStopId: z.string().min(1),
   dropStopId: z.string().min(1),
   seats: z.number().int().min(1).max(3).default(1),
-  waitAndSave: z.boolean().default(false),
+  /**
+   * Cash or TeslaCash (the WALLET). A joining rider is the second or later
+   * passenger on the trip, so there is no wait-and-save promise to make —
+   * they are joining a car that is already waiting on someone else.
+   */
   paymentMethod: z.enum(["CASH", "WALLET"]).default("CASH"),
 });
 
@@ -70,7 +74,6 @@ openRidesRouter.post(
       pickupStopId: body.pickupStopId,
       dropStopId: body.dropStopId,
       seats: body.seats,
-      waitAndSave: body.waitAndSave,
       paymentMethod: body.paymentMethod,
     });
     res.status(201).json(result);
@@ -106,7 +109,7 @@ export interface OpenRide {
 const ACTIVE = "('MATCHED', 'DRIVER_ARRIVED', 'STARTED')";
 
 export async function listOpenRides(passengerId: string): Promise<OpenRide[]> {
-  const { rows } = await query<{
+const { rows } = await query<{
     ride_id: string;
     status: RideStatus;
     seats_taken: number;
@@ -116,7 +119,7 @@ export async function listOpenRides(passengerId: string): Promise<OpenRide[]> {
     started_at: Date | null;
   }>(
     `SELECT r.id AS ride_id, r.status, r.seats_taken, r.capacity,
-            v.name AS vehicle_name, u.name AS driver_name, r.updated_at AS started_at
+            v.name AS vehicle_name, u.name AS driver_name, r.started_at
      FROM rides r
      JOIN vehicles v ON v.id = r.vehicle_id
      JOIN users u ON u.id = v.driver_id
@@ -226,6 +229,12 @@ function occupancyFor(
  *
  * The pickup must lie on the trip's remaining route and the drop must be
  * further along it — otherwise "hop on" is meaningless.
+ *
+ * A hop-on rider always lands at MATCHED. They get the same lifecycle the
+ * first passenger had: the driver accepted their request, and from here the
+ * driver marks "I have arrived" at their pickup stop, starts them, and drops
+ * them off at their own destination. There is no wait-and-save discount for a
+ * joiner — their wait buys the driver nothing, since the car is already out.
  */
 export async function hopOnRide({
   rideId,
@@ -233,7 +242,6 @@ export async function hopOnRide({
   pickupStopId,
   dropStopId,
   seats,
-  waitAndSave,
   paymentMethod = "CASH",
 }: {
   rideId: string;
@@ -241,7 +249,6 @@ export async function hopOnRide({
   pickupStopId: string;
   dropStopId: string;
   seats: number;
-  waitAndSave: boolean;
   paymentMethod?: "CASH" | "WALLET";
 }) {
   if (pickupStopId === dropStopId) throw badRequest("Pickup and destination must differ");
@@ -281,14 +288,17 @@ export async function hopOnRide({
       throw conflict("ACTIVE_RIDE_EXISTS", "You already have a ride in progress");
     }
 
+    // Always MATCHED, never the ride's own stage: the driver still has to arrive
+    // at this rider's pickup stop, start them and drop them off at where they
+    // are going, exactly as they did for the first passenger.
     const row = firstOrNull(
       await client.query<RideRequestRow>(
         `INSERT INTO ride_requests
           (passenger_id, ride_id, pickup_stop, drop_stop, route_id, leg_ids, stop_ids, seats, status,
            base_fare_paisa, distance_charge_paisa, pool_discount_paisa, wait_save_discount_paisa,
            total_fare_paisa, wait_and_save, payment_method)
-         VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8,
-                 $9, 0, 0, 0, $9, $10, $11)
+         VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, 'MATCHED',
+                 $8, 0, 0, 0, $8, FALSE, $9)
          RETURNING *`,
         [
           passengerId,
@@ -298,10 +308,7 @@ export async function hopOnRide({
           legIds,
           ahead.slice(boardAt, dropAt + 1),
           seats,
-          // Boarding a moving car means starting at that stage, not MATCHED.
-          ride.status,
           BASE_FARE_PAISA,
-          waitAndSave,
           paymentMethod,
         ],
       ),
@@ -319,7 +326,7 @@ export async function hopOnRide({
     }
 
     // Fare is provisional here; recomputeRideFares prices it with everyone on board.
-    const provisional = priceLegs(legIds.map(edgeByLegId), {}, waitAndSave);
+    const provisional = priceLegs(legIds.map(edgeByLegId), {});
     await client.query(
       `UPDATE ride_requests
        SET distance_charge_paisa = $2, pool_discount_paisa = $3,

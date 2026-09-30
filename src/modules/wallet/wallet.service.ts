@@ -154,9 +154,11 @@ function toTransactionView(row: WalletTransactionRow): TransactionView {
  * rider advancing, a drop-off, the trip finishing) and must only ever charge
  * once.
  *
- * A passenger who cannot cover the fare is left unsettled rather than being
- * charged a negative balance: the ride still happened, so it still completes,
- * and the debt is visible as an unpaid request rather than a mangled ledger.
+ * The debit is unconditional: the balance is allowed to go negative. A TeslaCash
+ * rider who tops up later settles the debt; blocking the charge instead left
+ * the ride unpaid forever and hid a real debt behind a "TeslaPay pending"
+ * label. The ledger is signed, so a negative `balance_after_paisa` reconciles
+ * exactly like any other balance.
  */
 export async function settleRidePayment(
   client: DbClient,
@@ -181,13 +183,13 @@ export async function settleRidePayment(
   const payer = firstOrNull(
     await client.query<WalletRow>(
       `UPDATE wallets SET balance_paisa = balance_paisa - $2, updated_at = now()
-       WHERE user_id = $1 AND balance_paisa >= $2
+       WHERE user_id = $1
        RETURNING *`,
       [request.passenger_id, amount],
     ),
   );
-  // No row back means the conditional UPDATE matched nothing: not enough money.
-  if (!payer) return { settled: false, amountPaisa: amount, reason: "insufficient funds" };
+  // Only missing if the wallet row vanished between ensureWallet and here.
+  if (!payer) return { settled: false, amountPaisa: amount, reason: "wallet missing" };
 
   const payee = firstOrNull(
     await client.query<WalletRow>(

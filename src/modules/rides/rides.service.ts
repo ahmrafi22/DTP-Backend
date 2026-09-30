@@ -271,6 +271,7 @@ export function serializeRide(row: RideRow): SerializedRide {
     capacity: row.capacity,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    startedAt: row.started_at ?? null,
   };
 }
 
@@ -295,11 +296,20 @@ export async function recomputeRideFares(client: DbClient, rideId: string): Prom
     }
   }
 
-  // Wait & Save is offered to the first rider on a trip only. Their wait is
-  // what buys the driver the time to fill the rest of the car; a rider joining
-  // later did not delay anything, so it earns no extra discount. `rows` is
-  // ordered by created_at, so the head of the list is that first rider.
-  const firstRequestId = rows[0]?.id ?? null;
+  // Wait & Save belongs to the one rider who booked first and held the car
+  // while it filled up. "First" is measured across every member of the ride
+  // rather than off `rows`, which only holds the riders still aboard: reading
+  // it off `rows` handed the discount to whoever was left behind the moment
+  // the original rider was dropped off, and it migrated again on every
+  // cancel. A cancelled request clears its ride_id, so it drops out of this
+  // query on its own and the slot passes to whoever is genuinely holding the
+  // car now. Joiners (second and later passengers) never carry wait_and_save
+  // at all, so they can never be this rider either.
+  const { rows: allMembers } = await client.query<{ id: string }>(
+    `SELECT id FROM ride_requests WHERE ride_id = $1 ORDER BY created_at LIMIT 1`,
+    [rideId],
+  );
+  const firstRequestId = allMembers[0]?.id ?? null;
 
   for (const req of rows) {
     const legs = req.leg_ids.map(edgeByLegId);
@@ -682,12 +692,14 @@ export async function joinRide({
     }
 
     const attach = await client.query(
-      // Boarding a trip that is already under way means the rider joins at
-      // that stage of the journey. Leaving them at MATCHED would show
-      // "driver on the way" next to someone already marked "on the trip".
+      // A joiner always boards at MATCHED — "the driver accepted this
+      // request" — even when the car is already under way. Inheriting the
+      // ride's current stage made a brand-new rider appear halfway through a
+      // journey they had not started, and it skipped the driver's own "I have
+      // arrived" confirmation for their pickup stop.
       `UPDATE ride_requests SET status = $3, ride_id = $2, updated_at = now()
        WHERE id = $1 AND status = 'REQUESTED'`,
-      [requestId, rideId, current.status],
+      [requestId, rideId, "MATCHED"],
     );
     if (rowsAffected(attach) === 0) {
       throw conflict("REQUEST_NO_LONGER_AVAILABLE", "Request was claimed elsewhere");
@@ -799,12 +811,16 @@ export async function cancelRequest({
 /**
  * Ride transition: arrived / start / complete.
  *
- * The driver running the ride may always drive it. A passenger may also
- * `complete` a trip they are on: in the demo they are the other half of the
- * journey, and letting them close out a run that has clearly finished is
- * friendlier than leaving the ride stuck at STARTED because the driver walked
- * away. They cannot touch arrived/start, and they cannot finish a ride they
- * are not part of.
+ * Either side may close the trip out. The driver running the ride can always
+ * drive it, and a passenger on the ride can `complete` too — in the demo they
+ * are the other half of the journey, and letting them close a run that has
+ * clearly finished is friendlier than leaving the ride stuck at STARTED because
+ * the driver walked away. They cannot touch arrived/start, and they cannot
+ * finish a ride they are not part of.
+ *
+ * Completing cascades to every rider on the ride: the auto has finished the
+ * whole run, whoever pressed the button. A passenger who wants only their own
+ * seat closed out uses the per-rider drop-off, which the driver drives.
  */
 export async function advanceRide({
   rideId,
@@ -843,10 +859,22 @@ export async function advanceRide({
       throw conflict("INVALID_TRANSITION", `Cannot go from ${ride.status} to ${next}`);
     }
 
-    await client.query("UPDATE rides SET status = $2, updated_at = now() WHERE id = $1", [
-      rideId,
-      next,
-    ]);
+    // Stamp the trip clock exactly once, on the way into STARTED. Written
+    // separately from the status update because it must never be rewritten by
+    // any later transition -- that is what keeps every client's auto in the
+    // same place for the whole ride.
+    if (next === "STARTED") {
+      await client.query(
+        `UPDATE rides SET status = $2, started_at = COALESCE(started_at, now()), updated_at = now()
+         WHERE id = $1`,
+        [rideId, next],
+      );
+    } else {
+      await client.query("UPDATE rides SET status = $2, updated_at = now() WHERE id = $1", [
+        rideId,
+        next,
+      ]);
+    }
     await client.query(
       `UPDATE ride_requests SET status = $2, updated_at = now()
        WHERE ride_id = $1 AND status IN ('MATCHED', 'DRIVER_ARRIVED', 'STARTED')`,
@@ -982,8 +1010,17 @@ export async function advanceRider({
           "MATCHED" as RequestStatus,
         );
       if (STAGE_RANK[furthest] > STAGE_RANK[ride.status]) {
+        // A rider being started can drag the ride into STARTED too, so the
+        // trip clock has to be anchored here as well. COALESCE keeps it
+        // immutable once the trip-level transition already set it.
         await client.query(
-          `UPDATE rides SET status = $2, updated_at = now() WHERE id = $1`,
+          `UPDATE rides
+              SET status = $2,
+                  started_at = CASE WHEN $2 = 'STARTED'
+                                    THEN COALESCE(started_at, now())
+                                    ELSE started_at END,
+                  updated_at = now()
+            WHERE id = $1`,
           [rideId, furthest],
         );
       }
@@ -1055,13 +1092,12 @@ export async function dropOffRider({
        WHERE ride_id = $1 AND status IN ('MATCHED','DRIVER_ARRIVED','STARTED') LIMIT 1`,
       [rideId],
     );
-    let rideCompleted = false;
-    if (rowsAffected(left) === 0) {
+    const rideCompleted = rowsAffected(left) === 0;
+    if (rideCompleted) {
       await client.query(
         `UPDATE rides SET status = 'COMPLETED', updated_at = now() WHERE id = $1`,
         [rideId],
       );
-      rideCompleted = true;
     }
 
     const freshRequest = firstOrNull(
