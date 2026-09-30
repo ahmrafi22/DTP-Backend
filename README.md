@@ -32,6 +32,18 @@ npm test                  # vitest (reseeds per suite, runs sequentially)
 server, whose auto-shuttle scheduler would keep writing trips mid-test. Stop
 `npm run dev` first, or start it with `SHUTTLE_SCHEDULER=off`.
 
+### Docker (no local Postgres needed)
+
+```bash
+docker compose up --build
+```
+
+Brings up Postgres and the API, applies migrations, loads the demo world on a
+fresh database (and leaves real data alone on later restarts), and serves
+`http://localhost:4000` with a health check on `/health`. The compose stack is
+the reproducible local default; to run against Neon or any other Postgres,
+just point `DATABASE_URL` at it — the same image works unchanged.
+
 Production path:
 
 ```bash
