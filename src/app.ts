@@ -29,6 +29,12 @@ export function createApp(): Express {
     }
   });
 
+  // Landing info for browsers/humans — this is an API, every resource lives
+  // under its own route. Keeps GET / a 200 instead of a 404.
+  app.get("/", (_req: Request, res: Response) => {
+    res.json({ ok: true, service: "dtp-backend", health: "/health" });
+  });
+
   app.use(authRouter);
   app.use(networkRouter);
   // Mounted before ridesRouter: its GET /rides/:id would otherwise match
