@@ -31,7 +31,11 @@ export type {
   RidersPerLeg,
 } from "./data.js";
 
-export { priceLegs } from "./pricing.js";
+export {
+  priceLegs,
+  WAIT_SAVE_DISCOUNT_PCT,
+  WAIT_SAVE_MINUTES,
+} from "./pricing.js";
 export type { LegFare, FareLineBreakdown } from "./pricing.js";
 
 export {

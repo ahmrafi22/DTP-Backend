@@ -5,9 +5,10 @@ import { pool } from "../shared/db.js";
 import { logger } from "../shared/logger.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-// Resolves to ./sql from both src/ (tsx) and dist/ (compiled) — one level up
-// from the module in either case.
-const sqlDir = join(here, "..", "sql");
+// This module lives two levels below the project root — src/db/ when run via
+// tsx, dist/db/ when compiled — so the schema directory is two levels up.
+// One level up would resolve to src/sql, which does not exist.
+const sqlDir = join(here, "..", "..", "sql");
 
 /** Apply every sql/*.sql file not yet recorded in schema_migrations. */
 export async function migrate(): Promise<void> {

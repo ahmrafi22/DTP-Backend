@@ -2,15 +2,22 @@ import { firstOrNull, query, rowsAffected, withTransaction } from "../../shared/
 import type { DbClient } from "../../shared/db.js";
 import { badRequest, conflict, forbidden, notFound } from "../../shared/errors.js";
 import {
+  WAIT_SAVE_MINUTES,
   edgeByLegId,
+  edgeKey,
   getRoute,
   legsBetween,
   priceLegs,
   shortestPath,
 } from "../../graph/index.js";
+import {
+  driverIdForRide,
+  settleRidePayment,
+} from "../wallet/wallet.service.js";
 import type { Edge, RidersPerLeg } from "../../graph/index.js";
 import type {
   Fare,
+  RequestStatus,
   FareLegRow,
   FareLine,
   RideEventRow,
@@ -30,6 +37,7 @@ import type {
 import {
   ACTIVE_RIDE_STATUSES,
   ALLOWED_NEXT,
+  STAGE_RANK,
   isCancellable,
 } from "./rides.constants.js";
 
@@ -98,6 +106,14 @@ export interface DriverTrip extends SerializedRide {
 export interface ActivePassengerView {
   request: SerializedRequest;
   trip?: SerializedRide | null;
+  /**
+   * The whole trip's ordered stops, not just this rider's slice of them.
+   *
+   * Everyone on one Tesla shares one line on the map: a rider who joined at
+   * Gulshan 1 still draws Banani → Gulshan 1 → Gulshan 2 → Gulshan 1 →
+   * Mohakhali, because that is the journey the car is actually making.
+   */
+  routeStopIds?: string[];
   vehicle?: { id: string; name: string; capacity: number; driverName: string } | null;
   coRiders?: SerializedCoRider[];
 }
@@ -122,17 +138,61 @@ export function resolveTrip({
     if (!legs || !route) throw badRequest("Stops are not on that corridor in travel order");
     const i = route.stops.indexOf(pickupStopId);
     const j = route.stops.indexOf(dropStopId);
-    return {
-      routeId,
-      legs,
-      stopIds: route.stops.slice(Math.min(i, j), Math.max(i, j) + 1),
-    };
+    // Travel order, not corridor order. `legsBetween` reverses the legs when
+    // the rider is heading downhill along the corridor, so the stops have to
+    // follow: a Mohakhali -> Banani trip must not store its stops running
+    // Banani -> Mohakhali, or the map animates the auto backwards.
+    const stopIds =
+      i < j ? route.stops.slice(i, j + 1) : route.stops.slice(j, i + 1).reverse();
+    return { routeId, legs, stopIds };
   }
 
   // No corridor given: the single fastest path through the graph.
   const path = shortestPath(pickupStopId, dropStopId, "durationMin");
   if (!path) throw badRequest("No route connects these stops in the demo graph");
   return { routeId: null, legs: path.legs, stopIds: path.stops };
+}
+
+/**
+ * Ordered union of every member's stops, first-seen order preserved.
+ *
+ * This is the trip's *whole* route. Individual riders each carry only the
+ * slice they ride — two riders on one Tesla should see one line on the map,
+ * not two overlapping ones — so the map always draws this.
+ */
+export function orderedRoute(stopLists: readonly (readonly string[])[]): string[] {
+  const seen = new Set<string>();
+  const route: string[] = [];
+  for (const stops of stopLists) {
+    for (const stop of stops) {
+      if (!seen.has(stop)) {
+        seen.add(stop);
+        route.push(stop);
+      }
+    }
+  }
+  return route;
+}
+
+/**
+ * Leg ids between two stops on an ordered route, sliced to [fromIndex, toIndex].
+ *
+ * Used by hop-on, where the passenger's pickup and drop are both stops the
+ * running trip has not reached yet.
+ */
+export function legIdsBetween(
+  routeStopIds: readonly string[],
+  fromIndex: number,
+  toIndex: number,
+): string[] {
+  const ids: string[] = [];
+  for (let i = fromIndex; i < toIndex; i += 1) {
+    const a = routeStopIds[i];
+    const b = routeStopIds[i + 1];
+    if (a === undefined || b === undefined) continue;
+    ids.push(edgeKey(a, b));
+  }
+  return ids;
 }
 
 // ---------- fares ----------
@@ -142,6 +202,7 @@ function fareFromRow(row: RideRequestRow, lines: FareLine[]): Fare {
     baseFare: row.base_fare_paisa,
     distanceCharge: row.distance_charge_paisa,
     poolDiscount: row.pool_discount_paisa,
+    waitSaveDiscount: row.wait_save_discount_paisa,
     total: row.total_fare_paisa,
     lines,
   };
@@ -191,6 +252,9 @@ export function serializeRequest(
     status: row.status,
     rating: row.rating,
     cancelReason: row.cancel_reason,
+    waitAndSave: row.wait_and_save,
+    paymentMethod: row.payment_method,
+    settled: row.settled_at !== null,
     fare: fareFromRow(row, lines),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -231,9 +295,16 @@ export async function recomputeRideFares(client: DbClient, rideId: string): Prom
     }
   }
 
+  // Wait & Save is offered to the first rider on a trip only. Their wait is
+  // what buys the driver the time to fill the rest of the car; a rider joining
+  // later did not delay anything, so it earns no extra discount. `rows` is
+  // ordered by created_at, so the head of the list is that first rider.
+  const firstRequestId = rows[0]?.id ?? null;
+
   for (const req of rows) {
     const legs = req.leg_ids.map(edgeByLegId);
-    const fare = priceLegs(legs, ridersPerLeg);
+    const earnsWaitSave = req.wait_and_save && req.id === firstRequestId;
+    const fare = priceLegs(legs, ridersPerLeg, earnsWaitSave);
 
     await client.query("DELETE FROM fare_legs WHERE request_id = $1", [req.id]);
     for (let i = 0; i < fare.lines.length; i += 1) {
@@ -258,9 +329,16 @@ export async function recomputeRideFares(client: DbClient, rideId: string): Prom
     await client.query(
       `UPDATE ride_requests
        SET base_fare_paisa = $2, distance_charge_paisa = $3, pool_discount_paisa = $4,
-           total_fare_paisa = $5, updated_at = now()
+           wait_save_discount_paisa = $5, total_fare_paisa = $6, updated_at = now()
        WHERE id = $1`,
-      [req.id, fare.baseFare, fare.distanceCharge, fare.poolDiscount, fare.total],
+      [
+        req.id,
+        fare.baseFare,
+        fare.distanceCharge,
+        fare.poolDiscount,
+        fare.waitSaveDiscount,
+        fare.total,
+      ],
     );
   }
 
@@ -361,6 +439,8 @@ export async function createRequest({
   routeId,
   seats = 1,
   idempotencyKey = null,
+  waitAndSave = false,
+  paymentMethod = "CASH",
 }: {
   passengerId: string;
   pickupStopId: string;
@@ -368,6 +448,8 @@ export async function createRequest({
   routeId?: string | null;
   seats?: number;
   idempotencyKey?: string | null;
+  waitAndSave?: boolean;
+  paymentMethod?: "CASH" | "WALLET";
 }): Promise<{ request: SerializedRequest | null; replayed: boolean }> {
   if (idempotencyKey) {
     const existing = firstOrNull(
@@ -379,7 +461,7 @@ export async function createRequest({
   }
 
   const trip = resolveTrip({ pickupStopId, dropStopId, routeId });
-  const fare = priceLegs(trip.legs);
+  const fare = priceLegs(trip.legs, {}, waitAndSave);
 
   const created = await withTransaction(async (client) => {
     // Duplicate-tap protection (PRD stretch): one active request per passenger.
@@ -397,8 +479,11 @@ export async function createRequest({
       await client.query<RideRequestRow>(
         `INSERT INTO ride_requests
           (passenger_id, pickup_stop, drop_stop, route_id, leg_ids, stop_ids, seats, status,
-           base_fare_paisa, distance_charge_paisa, pool_discount_paisa, total_fare_paisa, idempotency_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'REQUESTED', $8, $9, $10, $11, $12)
+           base_fare_paisa, distance_charge_paisa, pool_discount_paisa,
+           wait_save_discount_paisa, total_fare_paisa, idempotency_key,
+           wait_and_save, wait_deadline, payment_method)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'REQUESTED', $8, $9, $10, $11, $12, $13,
+                 $14, now() + make_interval(mins => $15), $16)
          RETURNING *`,
         [
           passengerId,
@@ -411,8 +496,12 @@ export async function createRequest({
           fare.baseFare,
           fare.distanceCharge,
           fare.poolDiscount,
+          fare.waitSaveDiscount,
           fare.total,
           idempotencyKey,
+          waitAndSave,
+          waitAndSave ? WAIT_SAVE_MINUTES : 0,
+          paymentMethod,
         ],
       ),
     );
@@ -593,9 +682,12 @@ export async function joinRide({
     }
 
     const attach = await client.query(
-      `UPDATE ride_requests SET status = 'MATCHED', ride_id = $2, updated_at = now()
+      // Boarding a trip that is already under way means the rider joins at
+      // that stage of the journey. Leaving them at MATCHED would show
+      // "driver on the way" next to someone already marked "on the trip".
+      `UPDATE ride_requests SET status = $3, ride_id = $2, updated_at = now()
        WHERE id = $1 AND status = 'REQUESTED'`,
-      [requestId, rideId],
+      [requestId, rideId, current.status],
     );
     if (rowsAffected(attach) === 0) {
       throw conflict("REQUEST_NO_LONGER_AVAILABLE", "Request was claimed elsewhere");
@@ -705,16 +797,24 @@ export async function cancelRequest({
 }
 
 /**
- * Driver ride transition: arrived / start / complete. Applies the PRD §4
- * state machine to the ride and mirrors it onto all matched requests.
+ * Ride transition: arrived / start / complete.
+ *
+ * The driver running the ride may always drive it. A passenger may also
+ * `complete` a trip they are on: in the demo they are the other half of the
+ * journey, and letting them close out a run that has clearly finished is
+ * friendlier than leaving the ride stuck at STARTED because the driver walked
+ * away. They cannot touch arrived/start, and they cannot finish a ride they
+ * are not part of.
  */
 export async function advanceRide({
   rideId,
-  driverId,
+  actorId,
+  actorRole,
   next,
 }: {
   rideId: string;
-  driverId: string;
+  actorId: string;
+  actorRole: Role;
   next: RideStatus;
 }): Promise<{ ride: SerializedRide }> {
   return withTransaction(async (client) => {
@@ -723,8 +823,21 @@ export async function advanceRide({
     );
     if (!ride) throw notFound("Ride not found");
 
-    const vehicle = await requireVehicleForDriver(driverId);
-    if (ride.vehicle_id !== vehicle?.id) throw forbidden("Not your ride");
+    if (actorRole === "driver") {
+      const vehicle = await requireVehicleForDriver(actorId);
+      if (ride.vehicle_id !== vehicle?.id) throw forbidden("Not your ride");
+    } else {
+      // Passengers may only ever complete, and only their own ride.
+      if (next !== "COMPLETED") throw forbidden("Only the driver can move the trip along");
+      const onBoard = await client.query(
+        `SELECT 1 FROM ride_requests
+         WHERE ride_id = $1 AND passenger_id = $2
+           AND status IN ('MATCHED','DRIVER_ARRIVED','STARTED')
+         LIMIT 1`,
+        [rideId, actorId],
+      );
+      if (rowsAffected(onBoard) === 0) throw forbidden("You are not on this ride");
+    }
 
     if (!ALLOWED_NEXT[ride.status]?.includes(next)) {
       throw conflict("INVALID_TRANSITION", `Cannot go from ${ride.status} to ${next}`);
@@ -739,13 +852,231 @@ export async function advanceRide({
        WHERE ride_id = $1 AND status IN ('MATCHED', 'DRIVER_ARRIVED', 'STARTED')`,
       [rideId, next],
     );
-    await logEvent(client, { rideId, event: next, actorId: driverId });
+    await logEvent(client, { rideId, event: next, actorId });
+
+    // Finishing the whole trip settles every rider who just completed.
+    if (next === "COMPLETED") {
+      const { rows: finishing } = await client.query<{ id: string }>(
+        `SELECT id FROM ride_requests
+         WHERE ride_id = $1 AND status = 'COMPLETED' AND settled_at IS NULL
+           AND payment_method = 'WALLET'`,
+        [rideId],
+      );
+      for (const r of finishing) {
+        await settleIfOwed(client, rideId, r.id);
+      }
+    }
 
     const fresh = firstOrNull(
       await client.query<RideRow>("SELECT * FROM rides WHERE id = $1", [rideId]),
     );
     if (!fresh) throw new Error("Ride disappeared mid-transition");
     return { ride: serializeRide(fresh) };
+  });
+}
+
+/**
+ * Charge a just-finished rider's fare to the driver, if they paid by wallet.
+ *
+ * Shared by every path that can finish a ride so the money moves exactly once
+ * and `settled_at` guards the rest.
+ */
+async function settleIfOwed(
+  client: DbClient,
+  rideId: string,
+  requestId: string,
+): Promise<void> {
+  const { rows } = await client.query<{
+    id: string;
+    passenger_id: string;
+    payment_method: string;
+    total_fare_paisa: number;
+    settled_at: Date | null;
+  }>(
+    `SELECT id, passenger_id, payment_method, total_fare_paisa, settled_at
+     FROM ride_requests WHERE id = $1 AND ride_id = $2`,
+    [requestId, rideId],
+  );
+  const row = rows[0];
+  if (!row) return;
+
+  const driverId = await driverIdForRide(client, rideId);
+  if (!driverId) return;
+
+  await settleRidePayment(client, row, driverId);
+}
+
+/**
+ * Move ONE rider a single step through the lifecycle, independently of the
+ * others.
+ *
+ * The trip as a whole has one vehicle, but the driver is picking people up
+ * and setting them down at different points, so each rider's track advances
+ * on its own: the second rider still has "arrived" and "start" to be marked
+ * even after the first has been dropped off. The ride row is then re-synced
+ * to the furthest stage anyone has reached, so the trip still reads as one
+ * coherent journey rather than contradicting its own riders.
+ */
+export async function advanceRider({
+  rideId,
+  requestId,
+  actorId,
+}: {
+  rideId: string;
+  requestId: string;
+  actorId: string;
+}): Promise<{ request: SerializedRequest; ride: SerializedRide }> {
+  return withTransaction(async (client) => {
+    const ride = firstOrNull(
+      await client.query<RideRow>("SELECT * FROM rides WHERE id = $1 FOR UPDATE", [rideId]),
+    );
+    if (!ride) throw notFound("Ride not found");
+
+    const vehicle = await requireVehicleForDriver(actorId);
+    if (ride.vehicle_id !== vehicle?.id) throw forbidden("Not your ride");
+
+    const request = firstOrNull(
+      await client.query<RideRequestRow>(
+        `SELECT * FROM ride_requests WHERE id = $1 AND ride_id = $2 FOR UPDATE`,
+        [requestId, rideId],
+      ),
+    );
+    if (!request) throw notFound("That rider is not on this ride");
+
+    // MATCHED -> DRIVER_ARRIVED -> STARTED -> COMPLETED, one step at a time.
+    const next = ALLOWED_NEXT[request.status]?.find((s) => s !== "CANCELLED") as
+      | RequestStatus
+      | undefined;
+    if (!next) throw conflict("INVALID_TRANSITION", `Cannot advance a ${request.status} rider`);
+
+    await client.query(
+      `UPDATE ride_requests SET status = $2, updated_at = now() WHERE id = $1`,
+      [requestId, next],
+    );
+    await logEvent(client, { rideId, requestId, event: next, actorId });
+
+    // A rider reaching COMPLETED owes their fare to the driver.
+    if (next === "COMPLETED") {
+      await settleIfOwed(client, rideId, requestId);
+    }
+
+    // Keep the trip row consistent with the riders still aboard. Completed
+    // riders are deliberately excluded: someone already dropped off must not
+    // drag the whole trip forward and complete it early.
+    const { rows: aboard } = await client.query<{ status: RequestStatus }>(
+      `SELECT status FROM ride_requests
+       WHERE ride_id = $1 AND status IN ('MATCHED','DRIVER_ARRIVED','STARTED')`,
+      [rideId],
+    );
+    if (aboard.length === 0) {
+      // Nobody left on board — the trip is over.
+      await client.query(
+        `UPDATE rides SET status = 'COMPLETED', updated_at = now() WHERE id = $1`,
+        [rideId],
+      );
+    } else {
+      const furthest = aboard
+        .map((r) => r.status)
+        .reduce<RequestStatus>(
+          (acc, s) => (STAGE_RANK[s] > STAGE_RANK[acc] ? s : acc),
+          "MATCHED" as RequestStatus,
+        );
+      if (STAGE_RANK[furthest] > STAGE_RANK[ride.status]) {
+        await client.query(
+          `UPDATE rides SET status = $2, updated_at = now() WHERE id = $1`,
+          [rideId, furthest],
+        );
+      }
+    }
+
+    const freshRequest = firstOrNull(
+      await client.query<RideRequestRow>("SELECT * FROM ride_requests WHERE id = $1", [requestId]),
+    );
+    const freshRide = firstOrNull(
+      await client.query<RideRow>("SELECT * FROM rides WHERE id = $1", [rideId]),
+    );
+    if (!freshRequest || !freshRide) throw new Error("ride or request vanished mid advance");
+
+    return { request: serializeRequest(freshRequest), ride: serializeRide(freshRide) };
+  });
+}
+
+/**
+ * Drop one rider off, then finish the ride once nobody is left on board.
+ *
+ * A pooled trip does not end all at once: the auto reaches Gulshan 1, Rafiq
+ * gets out, and the remaining riders carry on to Mohakhali. Completing each
+ * rider separately is what makes that legible — and when the last one leaves,
+ * the ride itself completes rather than lingering at STARTED.
+ */
+export async function dropOffRider({
+  rideId,
+  requestId,
+  actorId,
+}: {
+  rideId: string;
+  requestId: string;
+  actorId: string;
+}): Promise<{ ride: SerializedRide; request: SerializedRequest; rideCompleted: boolean }> {
+  return withTransaction(async (client) => {
+    const ride = firstOrNull(
+      await client.query<RideRow>("SELECT * FROM rides WHERE id = $1 FOR UPDATE", [rideId]),
+    );
+    if (!ride) throw notFound("Ride not found");
+
+    const vehicle = await requireVehicleForDriver(actorId);
+    if (ride.vehicle_id !== vehicle?.id) throw forbidden("Not your ride");
+
+    const request = firstOrNull(
+      await client.query<RideRequestRow>(
+        `SELECT * FROM ride_requests WHERE id = $1 AND ride_id = $2 FOR UPDATE`,
+        [requestId, rideId],
+      ),
+    );
+    if (!request) throw notFound("That rider is not on this ride");
+    if (request.status === "COMPLETED") return { ride: serializeRide(ride), request: serializeRequest(request), rideCompleted: ride.status === "COMPLETED" };
+    if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
+      throw conflict("RIDE_NOT_ACTIVE", "This ride is no longer running");
+    }
+    if (ride.status !== "STARTED") {
+      throw conflict("RIDE_NOT_STARTED", "Start the trip before dropping anyone off");
+    }
+
+    await client.query(
+      `UPDATE ride_requests SET status = 'COMPLETED', updated_at = now() WHERE id = $1`,
+      [requestId],
+    );
+    await logEvent(client, { rideId, requestId, event: "COMPLETED", actorId });
+    await settleIfOwed(client, rideId, requestId);
+
+    // If that was the last rider, the ride is over too.
+    const left = await client.query(
+      `SELECT 1 FROM ride_requests
+       WHERE ride_id = $1 AND status IN ('MATCHED','DRIVER_ARRIVED','STARTED') LIMIT 1`,
+      [rideId],
+    );
+    let rideCompleted = false;
+    if (rowsAffected(left) === 0) {
+      await client.query(
+        `UPDATE rides SET status = 'COMPLETED', updated_at = now() WHERE id = $1`,
+        [rideId],
+      );
+      rideCompleted = true;
+    }
+
+    const freshRequest = firstOrNull(
+      await client.query<RideRequestRow>("SELECT * FROM ride_requests WHERE id = $1", [requestId]),
+    );
+    const freshRide = firstOrNull(
+      await client.query<RideRow>("SELECT * FROM rides WHERE id = $1", [rideId]),
+    );
+    if (!freshRequest || !freshRide) throw new Error("ride or request vanished mid drop-off");
+
+    return {
+      ride: serializeRide(freshRide),
+      request: serializeRequest(freshRequest),
+      rideCompleted,
+    };
   });
 }
 
@@ -863,8 +1194,14 @@ export async function activeRequestForPassenger(
     await query<RideRequestRow>(
       `SELECT * FROM ride_requests
        WHERE passenger_id = $1
-         AND (status IN ('REQUESTED', 'MATCHED', 'DRIVER_ARRIVED', 'STARTED')
-              OR updated_at > now() - interval '5 minutes')
+         AND (
+              status IN ('REQUESTED', 'MATCHED', 'DRIVER_ARRIVED', 'STARTED')
+              -- The grace window exists so a *finished* ride keeps its rating
+              -- and per-leg breakdown reachable for a moment. A cancelled ride
+              -- is over the moment it is cancelled: leaving it here made it
+              -- linger on screen, and the 2.5s poll kept resurrecting it.
+              OR (status = 'COMPLETED' AND updated_at > now() - interval '5 minutes')
+            )
        ORDER BY created_at DESC
        LIMIT 1`,
       [passengerId],
@@ -895,6 +1232,14 @@ export async function activeRequestForPassenger(
             driverName: vehicle.driver_name,
           }
         : null;
+      const { rows: crew } = await query<{ stop_ids: string[] }>(
+        `SELECT stop_ids FROM ride_requests
+         WHERE ride_id = $1 AND status IN ('MATCHED','DRIVER_ARRIVED','STARTED','COMPLETED')
+         ORDER BY created_at`,
+        [ride.id],
+      );
+      result.routeStopIds = orderedRoute(crew.map((r) => r.stop_ids));
+
       const members = await serializeRideMembers(ride.id);
       result.coRiders = serializeCoRiders(members, request.id);
     }

@@ -9,8 +9,10 @@ import {
   activeRequestForPassenger,
   advanceRide,
   cancelRequest,
+  advanceRider,
   createRequest,
   driverHistory,
+  dropOffRider,
   driverState,
   eventsForRide,
   getRequestById,
@@ -27,6 +29,7 @@ import { TRIP_ACTIONS } from "./rides.constants.js";
 import {
   acceptRequestsSchema,
   cancelRideSchema,
+  dropOffSchema,
   joinRideSchema,
   rateRideSchema,
   requestRideSchema,
@@ -55,6 +58,8 @@ ridesRouter.post(
       dropStopId: body.dropStopId,
       routeId: body.routeId ?? null,
       seats: body.seats,
+      waitAndSave: body.waitAndSave,
+      paymentMethod: body.paymentMethod,
       idempotencyKey: body.idempotencyKey ?? null,
     });
     res.status(replayed ? 200 : 201).json({ request, replayed });
@@ -153,17 +158,59 @@ ridesRouter.post(
   }),
 );
 
+// `complete` is also reachable by a passenger on the ride (see advanceRide),
+// so this branch is registered without the driver role gate; every other
+// transition still requires one.
 for (const [action, next] of TRIP_ACTIONS) {
+  const guards = action === "complete" ? [authenticate] : [authenticate, requireRole("driver")];
   ridesRouter.post(
     `/rides/:id/${action}`,
-    authenticate,
-    requireRole("driver"),
+    ...guards,
     asyncHandler(async (req, res) => {
-      const result = await advanceRide({ rideId: param(req, "id"), driverId: req.user.id, next });
+      const result = await advanceRide({
+        rideId: param(req, "id"),
+        actorId: req.user.id,
+        actorRole: req.user.role,
+        next,
+      });
       res.json(result);
     }),
   );
 }
+
+// Advance one rider a single step, independent of the others on the trip.
+ridesRouter.post(
+  "/rides/:id/rider/advance",
+  authenticate,
+  requireRole("driver"),
+  asyncHandler(async (req, res) => {
+    const body = dropOffSchema.parse(req.body);
+    res.json(
+      await advanceRider({
+        rideId: param(req, "id"),
+        requestId: body.requestId,
+        actorId: req.user.id,
+      }),
+    );
+  }),
+);
+
+// Drop one rider off; the ride completes itself when the last one leaves.
+ridesRouter.post(
+  "/rides/:id/drop-off",
+  authenticate,
+  requireRole("driver"),
+  asyncHandler(async (req, res) => {
+    const body = dropOffSchema.parse(req.body);
+    res.json(
+      await dropOffRider({
+        rideId: param(req, "id"),
+        requestId: body.requestId,
+        actorId: req.user.id,
+      }),
+    );
+  }),
+);
 
 ridesRouter.get(
   "/rides/:id/events",

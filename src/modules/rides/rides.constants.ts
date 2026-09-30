@@ -30,6 +30,19 @@ export const ALLOWED_NEXT: Readonly<Record<RequestStatus, readonly RequestStatus
   CANCELLED: [],
 };
 
+/**
+ * How far along each stage is, so the trip row can be re-synced to the
+ * furthest point any individual rider has reached.
+ */
+export const STAGE_RANK: Record<RequestStatus, number> = {
+  REQUESTED: -2,
+  MATCHED: 0,
+  DRIVER_ARRIVED: 1,
+  STARTED: 2,
+  COMPLETED: 3,
+  CANCELLED: -1,
+};
+
 /** A passenger may cancel from REQUESTED up to and including DRIVER_ARRIVED. */
 export const isCancellable = (status: RequestStatus): boolean =>
   status === "REQUESTED" || status === "MATCHED" || status === "DRIVER_ARRIVED";

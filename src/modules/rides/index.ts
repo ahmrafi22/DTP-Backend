@@ -1,10 +1,14 @@
 export { ridesRouter } from "./rides.routes.js";
+export { openRidesRouter } from "./open-rides.routes.js";
+export { listOpenRides, hopOnRide } from "./open-rides.routes.js";
+export type { OpenRide } from "./open-rides.routes.js";
 export {
   requestRideSchema,
   cancelRideSchema,
   acceptRequestsSchema,
   joinRideSchema,
   rateRideSchema,
+  dropOffSchema,
   setOnlineSchema,
 } from "./rides.schema.js";
 export {
@@ -13,13 +17,16 @@ export {
   ACTIVE_RIDE_STATUSES,
   TRIP_ACTIONS,
   isCancellable,
+  STAGE_RANK,
 } from "./rides.constants.js";
 export {
   acceptRequests,
   activeRequestForPassenger,
   advanceRide,
   cancelRequest,
+  advanceRider,
   createRequest,
+  dropOffRider,
   driverHistory,
   driverState,
   eventsForRide,

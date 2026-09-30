@@ -95,10 +95,16 @@ export interface RideRequestRow extends QueryResultRow {
   base_fare_paisa: number;
   distance_charge_paisa: number;
   pool_discount_paisa: number;
+  wait_save_discount_paisa: number;
   total_fare_paisa: number;
   idempotency_key: string | null;
   rating: number | null;
   cancel_reason: string | null;
+  wait_and_save: boolean;
+  wait_deadline: Date | null;
+  payment_method: "CASH" | "WALLET";
+  paid_paisa: number;
+  settled_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -209,6 +215,8 @@ export interface Fare {
   baseFare: number;
   distanceCharge: number;
   poolDiscount: number;
+  /** Extra discount from the Wait & Save promise; 0 when not used. */
+  waitSaveDiscount: number;
   total: number;
   lines: FareLine[];
 }
@@ -226,6 +234,12 @@ export interface SerializedRequest {
   status: RequestStatus;
   rating: number | null;
   cancelReason: string | null;
+  /** True when the passenger promised to wait at pickup for a discount. */
+  waitAndSave: boolean;
+  /** How this rider intends to pay; WALLET settles to the driver on completion. */
+  paymentMethod: "CASH" | "WALLET";
+  /** True once the fare has been moved to the driver's wallet. */
+  settled: boolean;
   fare: Fare;
   createdAt: Date;
   updatedAt: Date;
