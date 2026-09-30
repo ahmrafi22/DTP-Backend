@@ -1,0 +1,63 @@
+# Dhaka Tesla Pool — backend stack.
+#
+#   docker compose up --build
+#
+# Brings up Postgres and the API, applies migrations, loads the demo world on
+# a fresh database, and serves on http://localhost:4000 with a health check.
+# Point DATABASE_URL at Neon (or any Postgres) instead by exporting it — the
+# compose stack is the local, reproducible default.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dtp
+      POSTGRES_PASSWORD: dtp_local_dev
+      POSTGRES_DB: dtp
+    ports:
+      - "5433:5432"
+    volumes:
+      - dtp-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dtp -d dtp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: migrations, then the demo world if the database is empty.
+  db-init:
+    build: .
+    command: ["sh", "-c", "node dist/db/migrate.js && node scripts/seed-if-empty.mjs"]
+    environment:
+      DATABASE_URL: postgres://dtp:dtp_local_dev@db:5432/dtp
+      JWT_SECRET: ${JWT_SECRET:-dtp-compose-dev-secret-change-me}
+      BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-10}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    environment:
+      PORT: "4000"
+      DATABASE_URL: postgres://dtp:dtp_local_dev@db:5432/dtp
+      # The repo's development values; override in your own .env for anything real.
+      JWT_SECRET: ${JWT_SECRET:-dtp-compose-dev-secret-change-me}
+      BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-10}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      RATE_LIMIT_REQUESTS_MAX: ${RATE_LIMIT_REQUESTS_MAX:-5}
+      RATE_LIMIT_REQUESTS_WINDOW_MS: ${RATE_LIMIT_REQUESTS_WINDOW_MS:-60000}
+      # The living map's auto-shuttles (set "off" for a quiet, fixed world)
+      SHUTTLE_SCHEDULER: ${SHUTTLE_SCHEDULER:-on}
+    ports:
+      - "4000:4000"
+    depends_on:
+      db:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  dtp-pgdata:
