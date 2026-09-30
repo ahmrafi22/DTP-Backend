@@ -2,9 +2,9 @@ node_modules/
 dist/
 
 *.log
+
+# Local environment — never commit secrets. Keep .env on disk only.
 .env
-.env.*
-!.env.example
 
 # OS / editor noise
 .DS_Store
