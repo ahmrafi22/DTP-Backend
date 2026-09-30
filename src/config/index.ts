@@ -33,6 +33,8 @@ export const config: Config = {
 };
 
 if (!config.databaseUrl) {
+  // Never exit at import time: on serverless (Vercel) this would kill the
+  // function instance and surface as FUNCTION_INVOCATION_FAILED. Boot anyway
+  // and let /health report 503 until DATABASE_URL is configured.
   console.error("DATABASE_URL is required — copy .env.example to .env and fill it in.");
-  process.exit(1);
 }
