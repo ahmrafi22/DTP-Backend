@@ -138,6 +138,19 @@ POST /rides/:id/join      claim a seat with get-in/get-out stops
 POST /rides/:id/admit     driver admits a pre-booked rider mid-trip
 ```
 
+### Around the matched state
+
+| Endpoint | Who | What |
+|---|---|---|
+| `POST /rides/:id/decline` | driver | Pass on a pending request: it leaves *this* driver's list, stays open for the others, and is claimed by the first accept anywhere (which clears the declines). |
+| `POST /rides/:id/wait-and-save` | passenger | Answer the offer once (`{accept}`): hold the seat for `WAIT_AND_SAVE_SECONDS` (30s in the demo) to earn an extra 5%. Payout lands at completion and only if the promise ran out. |
+| `POST /rides/:id/finish` | passenger | "I'm out at my stop": completes that rider's leg; the ride completes when nobody is left riding. |
+
+Every one of these appends to `ride_events`, so a ride's story
+(`REQUEST_CREATED → MATCHED → DRIVER_ARRIVED → STARTED → DROPPED_OFF →
+COMPLETED`, plus `DECLINED` and `WAIT_AND_SAVE_*`) is reconstructable after
+the fact.
+
 ## Key decisions
 
 **Seat locking (PRD §11).** Joining a ride claims seats with one atomic
